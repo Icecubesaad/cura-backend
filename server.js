@@ -15,10 +15,17 @@ app.use(express.json());
 app.use('/uploads', express.static('uploads'));
 
 // MongoDB connection
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/multivendor_pharmacy', {
-  useNewUrlParser: true,
-  useUnifiedTopology: true
-});
+try {
+  const db = mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/multivendor_pharmacy', {
+    useNewUrlParser: true,
+    useUnifiedTopology: true
+  });
+  if(db){
+    console.log('database connected')
+  }
+} catch (error) {
+  console.log(error)
+}
 
 // Socket.io for real-time notifications
 io.on('connection', (socket) => {
@@ -38,11 +45,11 @@ app.set('io', io);
 
 // Routes
 app.use('/api/auth', require('./routes/auth'));
-app.use('/api/users', require('./routes/users'));
-app.use('/api/medicines', require('./routes/medicines'));
+app.use('/api/users', require('./routes/user'));
+app.use('/api/medicines', require('./routes/medicine'));
 app.use('/api/pharmacies', require('./routes/pharmacies'));
-app.use('/api/prescriptions', require('./routes/prescriptions'));
-app.use('/api/orders', require('./routes/orders'));
+app.use('/api/prescriptions', require('./routes/prescription'));
+app.use('/api/orders', require('./routes/order'));
 app.use('/api/admin', require('./routes/admin'));
 
 const PORT = process.env.PORT || 5000;

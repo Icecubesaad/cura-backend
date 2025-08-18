@@ -29,8 +29,55 @@ router.put('/profile', auth, async (req, res) => {
         email: user.email,
         phone: user.phone,
         address: user.address,
-        role: user.role
+        role: user.role,
+        credits: user.role === 'customer' ? user.credits : undefined
       }
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+router.get('/credits', auth, authorize('customer'), async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id)
+      .populate('creditHistory.orderId', 'orderNumber')
+      .select('credits creditHistory');
+
+    res.json({
+      credits: user.credits,
+      history: user.creditHistory
+        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+        .slice(0, 50) // Limit to recent 50 transactions
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Admin: Add credits to user (bonus credits)
+router.post('/credits/add', auth, authorize('admin'), async (req, res) => {
+  try {
+    const { userId, amount, description = 'Admin bonus credits' } = req.body;
+
+    if (amount <= 0) {
+      return res.status(400).json({ message: 'Amount must be greater than 0' });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    if (user.role !== 'customer') {
+      return res.status(400).json({ message: 'Credits can only be added to customer accounts' });
+    }
+
+    user.addCredits(amount, 'bonus', description);
+    await user.save();
+
+    res.json({ 
+      message: 'Credits added successfully',
+      newBalance: user.credits 
     });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
@@ -206,7 +253,7 @@ router.get('/doctor-referrals', auth, authorize('doctor'), async (req, res) => {
     const referrals = await User.find({ 
       referredBy: req.user._id,
       role: 'customer'
-    }).select('name email phone createdAt');
+    }).select('name email phone createdAt credits');
 
     res.json({
       referralCode: req.user.referralCode,

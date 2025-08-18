@@ -272,5 +272,45 @@ router.get('/prescriptions', auth, authorize('admin'), async (req, res) => {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
+// Admin: Get user credit statistics
+router.get('/credits/stats', auth, authorize('admin'), async (req, res) => {
+  try {
+    const stats = await User.aggregate([
+      { $match: { role: 'customer' } },
+      {
+        $group: {
+          _id: null,
+          totalUsers: { $sum: 1 },
+          totalCredits: { $sum: '$credits' },
+          averageCredits: { $avg: '$credits' },
+          maxCredits: { $max: '$credits' },
+          usersWithCredits: {
+            $sum: {
+              $cond: [{ $gt: ['$credits', 0] }, 1, 0]
+            }
+          }
+        }
+      }
+    ]);
 
+    // Get top credit holders
+    const topUsers = await User.find({ role: 'customer' })
+      .sort({ credits: -1 })
+      .limit(10)
+      .select('name email credits');
+
+    res.json({
+      stats: stats[0] || {
+        totalUsers: 0,
+        totalCredits: 0,
+        averageCredits: 0,
+        maxCredits: 0,
+        usersWithCredits: 0
+      },
+      topUsers
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
 module.exports = router;

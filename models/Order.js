@@ -10,7 +10,15 @@ const orderSchema = new mongoose.Schema({
     pharmacy: { type: mongoose.Schema.Types.ObjectId, ref: 'Pharmacy', required: true },
     quantity: { type: Number, required: true, min: 1 },
     price: { type: Number, required: true },
-    totalPrice: { type: Number, required: true }
+    totalPrice: { type: Number, required: true },
+    // Return status for individual items
+    returnStatus: {
+      type: String,
+      enum: ['not_returned', 'return_requested', 'return_approved', 'returned'],
+      default: 'not_returned'
+    },
+    returnRequestedAt: Date,
+    returnReason: String
   }],
   
   // Group items by pharmacy for separate processing
@@ -32,9 +40,14 @@ const orderSchema = new mongoose.Schema({
   }],
   
   totalAmount: { type: Number, required: true },
+  
+  // Credit system integration
+  creditsUsed: { type: Number, default: 0 },
+  finalAmount: { type: Number, required: true }, // totalAmount - creditsUsed
+  
   paymentStatus: { 
     type: String, 
-    enum: ['pending', 'paid', 'failed', 'refunded'], 
+    enum: ['pending', 'paid', 'failed', 'refunded', 'partially_refunded'], 
     default: 'pending' 
   },
   paymentId: String,
@@ -51,7 +64,25 @@ const orderSchema = new mongoose.Schema({
     type: String, 
     enum: ['pending', 'processing', 'partially_ready', 'ready', 'dispatched', 'delivered', 'cancelled'],
     default: 'pending' 
-  }
+  },
+  
+  // Return tracking
+  returnRequests: [{
+    items: [{ 
+      itemId: { type: mongoose.Schema.Types.ObjectId, required: true },
+      quantity: { type: Number, required: true },
+      reason: String
+    }],
+    status: {
+      type: String,
+      enum: ['pending', 'approved', 'rejected', 'processed'],
+      default: 'pending'
+    },
+    requestedAt: { type: Date, default: Date.now },
+    processedAt: Date,
+    refundAmount: Number,
+    adminNotes: String
+  }]
 }, { timestamps: true });
 
 // Auto-generate order number
