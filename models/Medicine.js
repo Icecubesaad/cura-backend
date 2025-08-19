@@ -15,7 +15,13 @@ const medicineSchema = new mongoose.Schema({
   sideEffects: [String],
   contraindications: [String],
   dosageInstructions: String,
-  image: String,
+  
+  // Updated image structure for Cloudinary
+  image: {
+    url: String, // Cloudinary URL
+    publicId: String // Cloudinary public_id for deletion
+  },
+  
   requiresPrescription: { type: Boolean, default: true },
   isActive: { type: Boolean, default: true }
 }, { timestamps: true });

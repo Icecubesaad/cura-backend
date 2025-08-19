@@ -1,47 +1,30 @@
 const express = require('express');
-const multer = require('multer');
-const path = require('path');
 const Prescription = require('../models/Prescription');
 const { auth, authorize } = require('../middleware/auth');
+const { uploadPrescription, deleteImage } = require('../config/cloudinary');
 
 const router = express.Router();
 
-// Configure multer for prescription image uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/prescriptions/');
-  },
-  filename: (req, file, cb) => {
-    cb(null, `prescription_${Date.now()}_${Math.round(Math.random() * 1E9)}${path.extname(file.originalname)}`);
-  }
-});
-
-const upload = multer({ 
-  storage,
-  fileFilter: (req, file, cb) => {
-    if (file.mimetype.startsWith('image/')) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only image files are allowed'), false);
-    }
-  },
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
-});
-
-// Upload prescription (customer)
-router.post('/upload', auth, authorize('customer'), upload.array('prescriptions', 5), async (req, res) => {
+// Upload prescription (customer) with Cloudinary
+router.post('/upload', auth, authorize('customer'), uploadPrescription.array('prescriptions', 10), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({ message: 'At least one prescription image is required' });
     }
 
-    const prescriptionImages = req.files.map(file => file.filename);
+    // Process uploaded files
+    const prescriptionImages = req.files.map(file => ({
+      url: file.path,
+      publicId: file.filename,
+      originalName: file.originalname
+    }));
+
     const { isUrgent = false } = req.body;
 
     const prescription = new Prescription({
       customer: req.user._id,
       prescriptionImages,
-      isUrgent
+      isUrgent: JSON.parse(isUrgent)
     });
 
     await prescription.save();
@@ -51,7 +34,8 @@ router.post('/upload', auth, authorize('customer'), upload.array('prescriptions'
     io.to('prescription_readers').emit('new_prescription', {
       id: prescription._id,
       customer: req.user.name,
-      isUrgent,
+      isUrgent: prescription.isUrgent,
+      imageCount: prescriptionImages.length,
       createdAt: prescription.createdAt
     });
 
@@ -60,11 +44,120 @@ router.post('/upload', auth, authorize('customer'), upload.array('prescriptions'
       prescription: {
         id: prescription._id,
         status: prescription.status,
-        images: prescription.prescriptionImages,
+        imageCount: prescriptionImages.length,
         isUrgent: prescription.isUrgent
       }
     });
   } catch (error) {
+    // Clean up uploaded files if database save fails
+    if (req.files) {
+      for (const file of req.files) {
+        try {
+          await deleteImage(file.filename);
+        } catch (cleanupError) {
+          console.error('Error cleaning up uploaded file:', cleanupError);
+        }
+      }
+    }
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Delete prescription image (customer only, before processing)
+router.delete('/:id/images/:imageIndex', auth, authorize('customer'), async (req, res) => {
+  try {
+    const { id, imageIndex } = req.params;
+    const index = parseInt(imageIndex);
+
+    const prescription = await Prescription.findById(id);
+    if (!prescription) {
+      return res.status(404).json({ message: 'Prescription not found' });
+    }
+
+    if (prescription.customer.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    if (prescription.status !== 'uploaded') {
+      return res.status(400).json({ message: 'Cannot modify prescription after processing has started' });
+    }
+
+    if (index < 0 || index >= prescription.prescriptionImages.length) {
+      return res.status(400).json({ message: 'Invalid image index' });
+    }
+
+    if (prescription.prescriptionImages.length <= 1) {
+      return res.status(400).json({ message: 'Cannot delete the last prescription image' });
+    }
+
+    const imageToDelete = prescription.prescriptionImages[index];
+
+    // Delete from Cloudinary
+    try {
+      await deleteImage(imageToDelete.publicId);
+    } catch (error) {
+      console.error('Error deleting image from Cloudinary:', error);
+    }
+
+    // Remove from prescription
+    prescription.prescriptionImages.splice(index, 1);
+    await prescription.save();
+
+    res.json({ message: 'Prescription image deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Add more prescription images (customer only, before processing)
+router.post('/:id/add-images', auth, authorize('customer'), uploadPrescription.array('prescriptions', 5), async (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ message: 'At least one prescription image is required' });
+    }
+
+    const prescription = await Prescription.findById(req.params.id);
+    if (!prescription) {
+      return res.status(404).json({ message: 'Prescription not found' });
+    }
+
+    if (prescription.customer.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    if (prescription.status !== 'uploaded') {
+      return res.status(400).json({ message: 'Cannot modify prescription after processing has started' });
+    }
+
+    if (prescription.prescriptionImages.length + req.files.length > 10) {
+      return res.status(400).json({ message: 'Maximum 10 images allowed per prescription' });
+    }
+
+    // Process new uploaded files
+    const newImages = req.files.map(file => ({
+      url: file.path,
+      publicId: file.filename,
+      originalName: file.originalname
+    }));
+
+    prescription.prescriptionImages.push(...newImages);
+    await prescription.save();
+
+    res.json({ 
+      message: 'Images added successfully',
+      totalImages: prescription.prescriptionImages.length
+    });
+  } catch (error) {
+    // Clean up uploaded files if database save fails
+    if (req.files) {
+      for (const file of req.files) {
+        try {
+          await deleteImage(file.filename);
+        } catch (cleanupError) {
+          console.error('Error cleaning up uploaded file:', cleanupError);
+        }
+      }
+    }
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
@@ -75,7 +168,7 @@ router.get('/queue', auth, authorize('prescription_reader'), async (req, res) =>
     const prescriptions = await Prescription.find({
       status: { $in: ['uploaded', 'reading'] }
     })
-    .populate('customer', 'name phone email')
+    .populate('customer', 'name phone email profileImage')
     .sort({ isUrgent: -1, createdAt: 1 });
 
     res.json(prescriptions);
@@ -146,8 +239,8 @@ router.put('/:id/process', auth, authorize('prescription_reader'), async (req, r
 router.get('/my-prescriptions', auth, authorize('customer'), async (req, res) => {
   try {
     const prescriptions = await Prescription.find({ customer: req.user._id })
-      .populate('medicines.medicine', 'name brand strength form')
-      .populate('medicines.alternatives', 'name brand strength form')
+      .populate('medicines.medicine', 'name brand strength form image')
+      .populate('medicines.alternatives', 'name brand strength form image')
       .sort({ createdAt: -1 });
 
     res.json(prescriptions);
@@ -160,10 +253,10 @@ router.get('/my-prescriptions', auth, authorize('customer'), async (req, res) =>
 router.get('/:id', auth, async (req, res) => {
   try {
     const prescription = await Prescription.findById(req.params.id)
-      .populate('customer', 'name phone email')
-      .populate('prescriptionReader', 'name')
-      .populate('medicines.medicine', 'name brand strength form category')
-      .populate('medicines.alternatives', 'name brand strength form category');
+      .populate('customer', 'name phone email profileImage')
+      .populate('prescriptionReader', 'name profileImage')
+      .populate('medicines.medicine', 'name brand strength form category image')
+      .populate('medicines.alternatives', 'name brand strength form category image');
 
     if (!prescription) {
       return res.status(404).json({ message: 'Prescription not found' });
@@ -179,6 +272,40 @@ router.get('/:id', auth, async (req, res) => {
     }
 
     res.json(prescription);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Delete prescription (customer only, before processing starts)
+router.delete('/:id', auth, authorize('customer'), async (req, res) => {
+  try {
+    const prescription = await Prescription.findById(req.params.id);
+    if (!prescription) {
+      return res.status(404).json({ message: 'Prescription not found' });
+    }
+
+    if (prescription.customer.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    if (prescription.status !== 'uploaded') {
+      return res.status(400).json({ message: 'Cannot delete prescription after processing has started' });
+    }
+
+    // Delete all images from Cloudinary
+    for (const image of prescription.prescriptionImages) {
+      try {
+        await deleteImage(image.publicId);
+      } catch (error) {
+        console.error('Error deleting prescription image:', error);
+      }
+    }
+
+    // Delete prescription document
+    await Prescription.findByIdAndDelete(req.params.id);
+
+    res.json({ message: 'Prescription deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
   }

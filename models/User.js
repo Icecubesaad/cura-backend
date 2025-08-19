@@ -21,7 +21,12 @@ const userSchema = new mongoose.Schema({
   isActive: { type: Boolean, default: true },
   referralCode: { type: String, unique: true, sparse: true }, // For doctors
   referredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // For customers referred by doctors
-  profileImage: String,
+  
+  // Updated profile image structure for Cloudinary
+  profileImage: {
+    url: String, // Cloudinary URL
+    publicId: String // Cloudinary public_id for deletion
+  },
   
   // Credit system - only for customers
   credits: { 

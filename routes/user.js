@@ -2,8 +2,72 @@ const express = require('express');
 const User = require('../models/User');
 const Vendor = require('../models/Vendor');
 const { auth, authorize } = require('../middleware/auth');
+const { uploadProfile, uploadVendorProduct, deleteImage, extractPublicId } = require('../config/cloudinary');
 
 const router = express.Router();
+
+// Upload profile image
+router.post('/upload-profile-image', auth, uploadProfile.single('profileImage'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No image file provided' });
+    }
+
+    const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    // Delete old profile image if exists
+    if (user.profileImage?.publicId) {
+      try {
+        await deleteImage(user.profileImage.publicId);
+      } catch (error) {
+        console.error('Error deleting old profile image:', error);
+      }
+    }
+
+    // Update user with new profile image
+    user.profileImage = {
+      url: req.file.path,
+      publicId: req.file.filename
+    };
+
+    await user.save();
+
+    res.json({
+      message: 'Profile image uploaded successfully',
+      profileImage: user.profileImage
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Delete profile image
+router.delete('/profile-image', auth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    if (!user.profileImage?.publicId) {
+      return res.status(400).json({ message: 'No profile image to delete' });
+    }
+
+    // Delete from Cloudinary
+    await deleteImage(user.profileImage.publicId);
+
+    // Remove from user document
+    user.profileImage = undefined;
+    await user.save();
+
+    res.json({ message: 'Profile image deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
 
 // Update user profile
 router.put('/profile', auth, async (req, res) => {
@@ -30,6 +94,7 @@ router.put('/profile', auth, async (req, res) => {
         phone: user.phone,
         address: user.address,
         role: user.role,
+        profileImage: user.profileImage,
         credits: user.role === 'customer' ? user.credits : undefined
       }
     });
@@ -37,6 +102,8 @@ router.put('/profile', auth, async (req, res) => {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
+
+// Get user credits and history
 router.get('/credits', auth, authorize('customer'), async (req, res) => {
   try {
     const user = await User.findById(req.user._id)
@@ -120,27 +187,85 @@ router.post('/vendor-profile', auth, authorize('vendor'), async (req, res) => {
   }
 });
 
-// Add product to vendor catalog
-router.post('/vendor-products', auth, authorize('vendor'), async (req, res) => {
+// Add product to vendor catalog with images
+router.post('/vendor-products', auth, authorize('vendor'), uploadVendorProduct.array('images', 5), async (req, res) => {
   try {
-    const { name, category, description, price, quantity, images } = req.body;
+    const { name, category, description, price, quantity } = req.body;
 
     const vendor = await Vendor.findOne({ owner: req.user._id });
     if (!vendor) {
       return res.status(400).json({ message: 'Vendor profile not found' });
     }
 
+    // Process uploaded images
+    const images = req.files ? req.files.map(file => ({
+      url: file.path,
+      publicId: file.filename
+    })) : [];
+
     vendor.products.push({
       name,
       category,
       description,
-      price,
-      quantity,
-      images: images || []
+      price: parseFloat(price),
+      quantity: parseInt(quantity),
+      images
     });
 
     await vendor.save();
-    res.json({ message: 'Product added successfully' });
+    res.json({ message: 'Product added successfully', images: images.length });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Update vendor product (including images)
+router.put('/vendor-products/:productId', auth, authorize('vendor'), uploadVendorProduct.array('images', 5), async (req, res) => {
+  try {
+    const { name, category, description, price, quantity, isActive, removeImages } = req.body;
+
+    const vendor = await Vendor.findOne({ owner: req.user._id });
+    if (!vendor) {
+      return res.status(400).json({ message: 'Vendor profile not found' });
+    }
+
+    const product = vendor.products.id(req.params.productId);
+    if (!product) {
+      return res.status(404).json({ message: 'Product not found' });
+    }
+
+    // Update basic fields
+    if (name) product.name = name;
+    if (category) product.category = category;
+    if (description) product.description = description;
+    if (price) product.price = parseFloat(price);
+    if (quantity !== undefined) product.quantity = parseInt(quantity);
+    if (isActive !== undefined) product.isActive = JSON.parse(isActive);
+
+    // Handle image removal
+    if (removeImages) {
+      const imagesToRemove = JSON.parse(removeImages);
+      for (const publicId of imagesToRemove) {
+        try {
+          await deleteImage(publicId);
+          product.images = product.images.filter(img => img.publicId !== publicId);
+        } catch (error) {
+          console.error('Error removing image:', error);
+        }
+      }
+    }
+
+    // Handle new images
+    if (req.files && req.files.length > 0) {
+      const newImages = req.files.map(file => ({
+        url: file.path,
+        publicId: file.filename
+      }));
+      product.images.push(...newImages);
+    }
+
+    await vendor.save();
+    res.json({ message: 'Product updated successfully', imagesCount: product.images.length });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
@@ -160,11 +285,9 @@ router.get('/vendor-products', auth, authorize('vendor'), async (req, res) => {
   }
 });
 
-// Update vendor product
-router.put('/vendor-products/:productId', auth, authorize('vendor'), async (req, res) => {
+// Delete vendor product (including images)
+router.delete('/vendor-products/:productId', auth, authorize('vendor'), async (req, res) => {
   try {
-    const { name, category, description, price, quantity, images, isActive } = req.body;
-
     const vendor = await Vendor.findOne({ owner: req.user._id });
     if (!vendor) {
       return res.status(400).json({ message: 'Vendor profile not found' });
@@ -175,16 +298,22 @@ router.put('/vendor-products/:productId', auth, authorize('vendor'), async (req,
       return res.status(404).json({ message: 'Product not found' });
     }
 
-    if (name) product.name = name;
-    if (category) product.category = category;
-    if (description) product.description = description;
-    if (price) product.price = price;
-    if (quantity !== undefined) product.quantity = quantity;
-    if (images) product.images = images;
-    if (isActive !== undefined) product.isActive = isActive;
+    // Delete all product images from Cloudinary
+    for (const image of product.images) {
+      if (image.publicId) {
+        try {
+          await deleteImage(image.publicId);
+        } catch (error) {
+          console.error('Error deleting product image:', error);
+        }
+      }
+    }
 
+    // Remove product from vendor
+    vendor.products.pull(req.params.productId);
     await vendor.save();
-    res.json({ message: 'Product updated successfully' });
+
+    res.json({ message: 'Product deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
@@ -194,7 +323,7 @@ router.put('/vendor-products/:productId', auth, authorize('vendor'), async (req,
 router.get('/vendor-profile', auth, authorize('vendor'), async (req, res) => {
   try {
     const vendor = await Vendor.findOne({ owner: req.user._id })
-      .populate('owner', 'name email phone');
+      .populate('owner', 'name email phone profileImage');
 
     if (!vendor) {
       return res.status(400).json({ message: 'Vendor profile not found' });
@@ -216,7 +345,7 @@ router.get('/vendors/search', async (req, res) => {
     if (state) query['address.state'] = new RegExp(state, 'i');
 
     const vendors = await Vendor.find(query)
-      .populate('owner', 'name')
+      .populate('owner', 'name profileImage')
       .select('businessName address phone products rating');
 
     // Filter products if search or category specified
@@ -253,7 +382,7 @@ router.get('/doctor-referrals', auth, authorize('doctor'), async (req, res) => {
     const referrals = await User.find({ 
       referredBy: req.user._id,
       role: 'customer'
-    }).select('name email phone createdAt credits');
+    }).select('name email phone createdAt credits profileImage');
 
     res.json({
       referralCode: req.user.referralCode,

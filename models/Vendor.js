@@ -21,7 +21,13 @@ const vendorSchema = new mongoose.Schema({
     description: String,
     price: { type: Number, required: true },
     quantity: { type: Number, required: true, min: 0 },
-    images: [String],
+    
+    // Updated images structure for Cloudinary
+    images: [{
+      url: String, // Cloudinary URL
+      publicId: String // Cloudinary public_id for deletion
+    }],
+    
     isActive: { type: Boolean, default: true }
   }],
   

@@ -6,6 +6,7 @@ const Vendor = require('../models/Vendor');
 const Order = require('../models/Order');
 const Prescription = require('../models/Prescription');
 const { auth, authorize } = require('../middleware/auth');
+const { uploadMedicine, deleteImage } = require('../config/cloudinary');
 
 const router = express.Router();
 
@@ -107,34 +108,217 @@ router.put('/users/:userId/toggle-status', auth, authorize('admin'), async (req,
   }
 });
 
-// Add medicine to big database
-router.post('/medicines', auth, authorize('admin'), async (req, res) => {
+// Add medicine to big database with image upload
+router.post('/medicines', auth, authorize('admin'), uploadMedicine.single('medicineImage'), async (req, res) => {
   try {
     const medicineData = req.body;
+
+    // Handle image upload
+    if (req.file) {
+      medicineData.image = {
+        url: req.file.path,
+        publicId: req.file.filename
+      };
+    }
+
     const medicine = new Medicine(medicineData);
     await medicine.save();
 
     res.status(201).json({ message: 'Medicine added successfully', medicine });
   } catch (error) {
+    // Clean up uploaded image if database save fails
+    if (req.file) {
+      try {
+        await deleteImage(req.file.filename);
+      } catch (cleanupError) {
+        console.error('Error cleaning up uploaded image:', cleanupError);
+      }
+    }
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
 
-// Update medicine
-router.put('/medicines/:id', auth, authorize('admin'), async (req, res) => {
+// Update medicine with optional image update
+router.put('/medicines/:id', auth, authorize('admin'), uploadMedicine.single('medicineImage'), async (req, res) => {
   try {
-    const medicine = await Medicine.findByIdAndUpdate(
-      req.params.id,
-      req.body,
-      { new: true, runValidators: true }
-    );
-
+    const medicine = await Medicine.findById(req.params.id);
     if (!medicine) {
       return res.status(404).json({ message: 'Medicine not found' });
     }
 
+    // Update basic fields
+    Object.keys(req.body).forEach(key => {
+      if (key !== 'image') {
+        medicine[key] = req.body[key];
+      }
+    });
+
+    // Handle new image upload
+    if (req.file) {
+      // Delete old image if exists
+      if (medicine.image?.publicId) {
+        try {
+          await deleteImage(medicine.image.publicId);
+        } catch (error) {
+          console.error('Error deleting old medicine image:', error);
+        }
+      }
+
+      // Set new image
+      medicine.image = {
+        url: req.file.path,
+        publicId: req.file.filename
+      };
+    }
+
+    await medicine.save();
+
     res.json({ message: 'Medicine updated successfully', medicine });
   } catch (error) {
+    // Clean up uploaded image if database save fails
+    if (req.file) {
+      try {
+        await deleteImage(req.file.filename);
+      } catch (cleanupError) {
+        console.error('Error cleaning up uploaded image:', cleanupError);
+      }
+    }
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Delete medicine image
+router.delete('/medicines/:id/image', auth, authorize('admin'), async (req, res) => {
+  try {
+    const medicine = await Medicine.findById(req.params.id);
+    if (!medicine) {
+      return res.status(404).json({ message: 'Medicine not found' });
+    }
+
+    if (!medicine.image?.publicId) {
+      return res.status(400).json({ message: 'No image to delete' });
+    }
+
+    // Delete from Cloudinary
+    await deleteImage(medicine.image.publicId);
+
+    // Remove from medicine document
+    medicine.image = undefined;
+    await medicine.save();
+
+    res.json({ message: 'Medicine image deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Delete medicine completely
+router.delete('/medicines/:id', auth, authorize('admin'), async (req, res) => {
+  try {
+    const medicine = await Medicine.findById(req.params.id);
+    if (!medicine) {
+      return res.status(404).json({ message: 'Medicine not found' });
+    }
+
+    // Delete image from Cloudinary if exists
+    if (medicine.image?.publicId) {
+      try {
+        await deleteImage(medicine.image.publicId);
+      } catch (error) {
+        console.error('Error deleting medicine image:', error);
+      }
+    }
+
+    await Medicine.findByIdAndDelete(req.params.id);
+
+    res.json({ message: 'Medicine deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Bulk upload medicines with images (for CSV imports, etc.)
+router.post('/medicines/bulk-upload', auth, authorize('admin'), uploadMedicine.array('images'), async (req, res) => {
+  try {
+    const { medicines } = req.body; // Array of medicine data
+    let parsedMedicines;
+
+    try {
+      parsedMedicines = JSON.parse(medicines);
+    } catch (error) {
+      return res.status(400).json({ message: 'Invalid medicines data format' });
+    }
+
+    const results = {
+      success: [],
+      failed: [],
+      total: parsedMedicines.length
+    };
+
+    // Map images by their original names or indices
+    const imageMap = new Map();
+    if (req.files) {
+      req.files.forEach((file, index) => {
+        imageMap.set(file.originalname, {
+          url: file.path,
+          publicId: file.filename
+        });
+        imageMap.set(index.toString(), {
+          url: file.path,
+          publicId: file.filename
+        });
+      });
+    }
+
+    for (let i = 0; i < parsedMedicines.length; i++) {
+      try {
+        const medicineData = parsedMedicines[i];
+
+        // Assign image if available
+        if (medicineData.imageIndex !== undefined) {
+          const image = imageMap.get(medicineData.imageIndex.toString());
+          if (image) {
+            medicineData.image = image;
+          }
+        } else if (medicineData.imageName) {
+          const image = imageMap.get(medicineData.imageName);
+          if (image) {
+            medicineData.image = image;
+          }
+        }
+
+        const medicine = new Medicine(medicineData);
+        await medicine.save();
+        
+        results.success.push({
+          index: i,
+          name: medicine.name,
+          id: medicine._id
+        });
+      } catch (error) {
+        results.failed.push({
+          index: i,
+          name: parsedMedicines[i].name || 'Unknown',
+          error: error.message
+        });
+      }
+    }
+
+    res.json({
+      message: 'Bulk upload completed',
+      results
+    });
+  } catch (error) {
+    // Clean up all uploaded images if bulk operation fails
+    if (req.files) {
+      for (const file of req.files) {
+        try {
+          await deleteImage(file.filename);
+        } catch (cleanupError) {
+          console.error('Error cleaning up uploaded image:', cleanupError);
+        }
+      }
+    }
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
@@ -192,9 +376,9 @@ router.get('/dashboard-stats', auth, authorize('admin'), async (req, res) => {
       Medicine.countDocuments({ isActive: true }),
       Order.countDocuments(),
       Prescription.countDocuments(),
-      Order.find().populate('customer', 'name').sort({ createdAt: -1 }).limit(10),
+      Order.find().populate('customer', 'name profileImage').sort({ createdAt: -1 }).limit(10),
       Prescription.find({ status: { $in: ['uploaded', 'reading'] } })
-        .populate('customer', 'name').sort({ createdAt: -1 }).limit(10)
+        .populate('customer', 'name profileImage').sort({ createdAt: -1 }).limit(10)
     ]);
 
     const stats = {
@@ -225,8 +409,8 @@ router.get('/orders', auth, authorize('admin'), async (req, res) => {
     }
 
     const orders = await Order.find(query)
-      .populate('customer', 'name email phone')
-      .populate('items.medicine', 'name brand')
+      .populate('customer', 'name email phone profileImage')
+      .populate('items.medicine', 'name brand image')
       .populate('pharmacyOrders.pharmacy', 'name')
       .limit(limit * 1)
       .skip((page - 1) * limit)
@@ -255,8 +439,8 @@ router.get('/prescriptions', auth, authorize('admin'), async (req, res) => {
     }
 
     const prescriptions = await Prescription.find(query)
-      .populate('customer', 'name email phone')
-      .populate('prescriptionReader', 'name')
+      .populate('customer', 'name email phone profileImage')
+      .populate('prescriptionReader', 'name profileImage')
       .limit(limit * 1)
       .skip((page - 1) * limit)
       .sort({ createdAt: -1 });
@@ -272,6 +456,7 @@ router.get('/prescriptions', auth, authorize('admin'), async (req, res) => {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
+
 // Admin: Get user credit statistics
 router.get('/credits/stats', auth, authorize('admin'), async (req, res) => {
   try {
@@ -297,7 +482,7 @@ router.get('/credits/stats', auth, authorize('admin'), async (req, res) => {
     const topUsers = await User.find({ role: 'customer' })
       .sort({ credits: -1 })
       .limit(10)
-      .select('name email credits');
+      .select('name email credits profileImage');
 
     res.json({
       stats: stats[0] || {
@@ -313,4 +498,5 @@ router.get('/credits/stats', auth, authorize('admin'), async (req, res) => {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
+
 module.exports = router;
