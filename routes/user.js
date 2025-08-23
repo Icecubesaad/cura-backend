@@ -69,10 +69,11 @@ router.delete('/profile-image', auth, async (req, res) => {
   }
 });
 
-// Update user profile
+// Update user profile - now includes WhatsApp
 router.put('/profile', auth, async (req, res) => {
   try {
-    const { name, phone, address } = req.body;
+    console.log('request recieved')
+    const { name, phone, whatsapp, address } = req.body;
     
     const user = await User.findById(req.user._id);
     if (!user) {
@@ -81,6 +82,7 @@ router.put('/profile', auth, async (req, res) => {
 
     if (name) user.name = name;
     if (phone) user.phone = phone;
+    if (whatsapp) user.whatsapp = whatsapp;
     if (address) user.address = address;
 
     await user.save();
@@ -92,11 +94,52 @@ router.put('/profile', auth, async (req, res) => {
         name: user.name,
         email: user.email,
         phone: user.phone,
+        whatsapp: user.whatsapp,
         address: user.address,
         role: user.role,
         profileImage: user.profileImage,
-        credits: user.role === 'customer' ? user.credits : undefined
+        credits: user.role === 'customer' ? user.credits : undefined,
+        // Include role-specific fields
+        permissions: user.role === 'app-services' ? user.permissions : undefined,
+        doctorLicense: user.role === 'doctor' ? user.doctorLicense : undefined,
+        readerLicense: user.role === 'prescription-reader' ? user.readerLicense : undefined,
+        pharmacyId: user.role === 'pharmacy' ? user.pharmacyId : undefined,
+        vendorId: user.role === 'vendor' ? user.vendorId : undefined
       }
+    });
+  } catch (error) {
+    console.log(error)
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Get user profile - enhanced to include all role-specific data
+router.get('/profile', auth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id).select('-password');
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    res.json({
+      id: user._id,
+      name: user.name,
+      email: user.email,
+      phone: user.phone,
+      whatsapp: user.whatsapp,
+      address: user.address,
+      role: user.role,
+      isActive: user.isActive,
+      createdAt: user.createdAt,
+      profileImage: user.profileImage,
+      credits: user.role === 'customer' ? user.credits : undefined,
+      // Include role-specific fields
+      permissions: user.role === 'app-services' ? user.permissions : undefined,
+      doctorLicense: user.role === 'doctor' ? user.doctorLicense : undefined,
+      readerLicense: user.role === 'prescription-reader' ? user.readerLicense : undefined,
+      pharmacyId: user.role === 'pharmacy' ? user.pharmacyId : undefined,
+      vendorId: user.role === 'vendor' ? user.vendorId : undefined,
+      referralCode: user.role === 'doctor' ? user.referralCode : undefined
     });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
@@ -145,6 +188,100 @@ router.post('/credits/add', auth, authorize('admin'), async (req, res) => {
     res.json({ 
       message: 'Credits added successfully',
       newBalance: user.credits 
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Admin: Get all users with filtering
+router.get('/admin/users', auth, authorize('admin'), async (req, res) => {
+  try {
+    const { role, search, page = 1, limit = 20 } = req.query;
+    
+    let query = {};
+    if (role) query.role = role;
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    const users = await User.find(query)
+      .select('-password')
+      .skip((page - 1) * limit)
+      .limit(parseInt(limit))
+      .sort({ createdAt: -1 });
+
+    const total = await User.countDocuments(query);
+
+    res.json({
+      users,
+      pagination: {
+        current: parseInt(page),
+        total: Math.ceil(total / limit),
+        count: users.length,
+        totalUsers: total
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// App Services: Get users for customer service
+router.get('/app-services/users', auth, authorize('app-services'), async (req, res) => {
+  try {
+    const { search, role = 'customer' } = req.query;
+    
+    let query = { role };
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } },
+        { phone: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    const users = await User.find(query)
+      .select('name email phone whatsapp address isActive createdAt credits')
+      .sort({ createdAt: -1 })
+      .limit(50);
+
+    res.json({ users });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Update user permissions (for app-services users)
+router.put('/app-services/permissions/:userId', auth, authorize('admin'), async (req, res) => {
+  try {
+    const { permissions } = req.body;
+    const { userId } = req.params;
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    if (user.role !== 'app-services') {
+      return res.status(400).json({ message: 'User must have app-services role' });
+    }
+
+    user.permissions = permissions;
+    await user.save();
+
+    res.json({ 
+      message: 'Permissions updated successfully',
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        permissions: user.permissions
+      }
     });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
@@ -323,7 +460,7 @@ router.delete('/vendor-products/:productId', auth, authorize('vendor'), async (r
 router.get('/vendor-profile', auth, authorize('vendor'), async (req, res) => {
   try {
     const vendor = await Vendor.findOne({ owner: req.user._id })
-      .populate('owner', 'name email phone profileImage');
+      .populate('owner', 'name email phone whatsapp profileImage');
 
     if (!vendor) {
       return res.status(400).json({ message: 'Vendor profile not found' });
@@ -382,12 +519,80 @@ router.get('/doctor-referrals', auth, authorize('doctor'), async (req, res) => {
     const referrals = await User.find({ 
       referredBy: req.user._id,
       role: 'customer'
-    }).select('name email phone createdAt credits profileImage');
+    }).select('name email phone whatsapp createdAt credits profileImage');
 
     res.json({
       referralCode: req.user.referralCode,
       totalReferrals: referrals.length,
       referrals
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Get all pharmacies (for app-services coordination)
+router.get('/pharmacies', auth, authorize(['admin', 'app-services']), async (req, res) => {
+  try {
+    const pharmacies = await User.find({ 
+      role: 'pharmacy',
+      isActive: true 
+    }).select('name email phone whatsapp pharmacyId address isActive createdAt');
+
+    res.json({ pharmacies });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Get app-services team members (for admin)
+router.get('/app-services/team', auth, authorize('admin'), async (req, res) => {
+  try {
+    const team = await User.find({ 
+      role: 'app-services',
+      isActive: true 
+    }).select('name email phone permissions isActive createdAt');
+
+    res.json({ team });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Switch user role (development only - remove in production)
+router.post('/switch-role', auth, async (req, res) => {
+  try {
+    const { role } = req.body;
+    
+    // Validate role
+    const validRoles = [
+      'customer', 'admin', 'pharmacy', 'doctor', 
+      'prescription-reader', 'database-input', 'vendor', 'app-services'
+    ];
+    
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ message: 'Invalid role specified' });
+    }
+
+    const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    user.role = role;
+    await user.save();
+
+    res.json({
+      message: 'Role switched successfully',
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        permissions: user.permissions,
+        isActive: user.isActive,
+        createdAt: user.createdAt
+      }
     });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });

@@ -1,9 +1,9 @@
 const express = require('express');
 const User = require('../models/User');
-const Medicine = require('../models/Medicine');
 const Pharmacy = require('../models/Pharmacy');
 const Vendor = require('../models/Vendor');
 const Order = require('../models/Order');
+const Product = require('../models/Product')
 const Prescription = require('../models/Prescription');
 const { auth, authorize } = require('../middleware/auth');
 const { uploadMedicine, deleteImage } = require('../config/cloudinary');
@@ -121,7 +121,7 @@ router.post('/medicines', auth, authorize('admin'), uploadMedicine.single('medic
       };
     }
 
-    const medicine = new Medicine(medicineData);
+    const medicine = new Product(medicineData);
     await medicine.save();
 
     res.status(201).json({ message: 'Medicine added successfully', medicine });
@@ -141,7 +141,7 @@ router.post('/medicines', auth, authorize('admin'), uploadMedicine.single('medic
 // Update medicine with optional image update
 router.put('/medicines/:id', auth, authorize('admin'), uploadMedicine.single('medicineImage'), async (req, res) => {
   try {
-    const medicine = await Medicine.findById(req.params.id);
+    const medicine = await Product.findById(req.params.id);
     if (!medicine) {
       return res.status(404).json({ message: 'Medicine not found' });
     }
@@ -190,7 +190,7 @@ router.put('/medicines/:id', auth, authorize('admin'), uploadMedicine.single('me
 // Delete medicine image
 router.delete('/medicines/:id/image', auth, authorize('admin'), async (req, res) => {
   try {
-    const medicine = await Medicine.findById(req.params.id);
+    const medicine = await Product.findById(req.params.id);
     if (!medicine) {
       return res.status(404).json({ message: 'Medicine not found' });
     }
@@ -215,7 +215,7 @@ router.delete('/medicines/:id/image', auth, authorize('admin'), async (req, res)
 // Delete medicine completely
 router.delete('/medicines/:id', auth, authorize('admin'), async (req, res) => {
   try {
-    const medicine = await Medicine.findById(req.params.id);
+    const medicine = await Product.findById(req.params.id);
     if (!medicine) {
       return res.status(404).json({ message: 'Medicine not found' });
     }
@@ -229,7 +229,7 @@ router.delete('/medicines/:id', auth, authorize('admin'), async (req, res) => {
       }
     }
 
-    await Medicine.findByIdAndDelete(req.params.id);
+    await Product.findByIdAndDelete(req.params.id);
 
     res.json({ message: 'Medicine deleted successfully' });
   } catch (error) {
@@ -287,7 +287,7 @@ router.post('/medicines/bulk-upload', auth, authorize('admin'), uploadMedicine.a
           }
         }
 
-        const medicine = new Medicine(medicineData);
+        const medicine = new Product(medicineData);
         await medicine.save();
         
         results.success.push({
@@ -373,7 +373,7 @@ router.get('/dashboard-stats', auth, authorize('admin'), async (req, res) => {
       User.countDocuments({ role: { $in: ['customer', 'pharmacy', 'vendor', 'doctor'] } }),
       Pharmacy.countDocuments(),
       Vendor.countDocuments(),
-      Medicine.countDocuments({ isActive: true }),
+      Product.countDocuments({ isActive: true }),
       Order.countDocuments(),
       Prescription.countDocuments(),
       Order.find().populate('customer', 'name profileImage').sort({ createdAt: -1 }).limit(10),

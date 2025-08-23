@@ -10,18 +10,7 @@ const router = express.Router();
 // Create order from processed prescription with credit system
 router.post('/create', auth, authorize('customer'), async (req, res) => {
   try {
-    const { prescriptionId, selectedMedicines, deliveryAddress, useCredits = 0 } = req.body;
-
-    const prescription = await Prescription.findById(prescriptionId)
-      .populate('medicines.medicine');
-
-    if (!prescription || prescription.customer.toString() !== req.user._id.toString()) {
-      return res.status(404).json({ message: 'Prescription not found' });
-    }
-
-    if (prescription.status !== 'processed') {
-      return res.status(400).json({ message: 'Prescription is not ready for ordering' });
-    }
+    const { selectedMedicines, deliveryAddress, useCredits = 0 } = req.body;
 
     // Get user with credits
     const customer = await User.findById(req.user._id);
@@ -97,7 +86,6 @@ router.post('/create', auth, authorize('customer'), async (req, res) => {
     // Create order
     const order = new Order({
       customer: req.user._id,
-      prescription: prescriptionId,
       items: orderItems,
       pharmacyOrders,
       totalAmount,
@@ -114,10 +102,6 @@ router.post('/create', auth, authorize('customer'), async (req, res) => {
       customer.useCredits(useCredits, `Used for order ${order.orderNumber}`, order._id);
       await customer.save();
     }
-
-    // Update prescription status
-    prescription.status = 'ready_for_order';
-    await prescription.save();
 
     res.status(201).json({
       message: 'Order created successfully',
@@ -363,11 +347,9 @@ router.put('/return-requests/:returnRequestId/process', auth, authorize('admin')
 // Get customer orders
 router.get('/my-orders', auth, authorize('customer'), async (req, res) => {
   try {
-    const orders = await Order.find({ customer: req.user._id })
-      .populate('items.medicine', 'name brand strength')
-      .populate('pharmacyOrders.pharmacy', 'name address')
-      .sort({ createdAt: -1 });
-
+    console.log(req.user._id)
+    const orders = await Order.find({ customerId: req.user._id })
+    console.log(orders)
     res.json(orders);
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
