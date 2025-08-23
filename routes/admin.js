@@ -1,501 +1,612 @@
 const express = require('express');
+const router = express.Router();
 const User = require('../models/User');
 const Pharmacy = require('../models/Pharmacy');
 const Vendor = require('../models/Vendor');
-const Order = require('../models/Order');
-const Product = require('../models/Product')
-const Prescription = require('../models/Prescription');
-const { auth, authorize } = require('../middleware/auth');
-const { uploadMedicine, deleteImage } = require('../config/cloudinary');
+const AdminSettings = require('../models/Admin');
+const { Governorate, City } = require('../models/Location');
+const { authenticateToken, authorizeRoles } = require('../middleware/auth');
 
-const router = express.Router();
+// Admin authentication middleware
+const adminOnly = [authenticateToken, authorizeRoles(['admin'])];
 
-// Generate referral code for doctors
-const generateReferralCode = () => {
-  return Math.random().toString(36).substr(2, 8).toUpperCase();
-};
+// =================== USER MANAGEMENT ===================
 
-// Create accounts (doctors, prescription readers, etc.)
-router.post('/create-account', auth, authorize('admin'), async (req, res) => {
+// GET all users with filters
+router.get('/users', ...adminOnly, async (req, res) => {
   try {
-    const { name, email, password, phone, role, additionalInfo } = req.body;
-
-    // Check if user exists
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({ message: 'User with this email already exists' });
-    }
-
-    const userData = { name, email, password, phone, role };
-
-    // Generate referral code for doctors
-    if (role === 'doctor') {
-      userData.referralCode = generateReferralCode();
-    }
-
-    // Add additional info to address if provided
-    if (additionalInfo && additionalInfo.address) {
-      userData.address = additionalInfo.address;
-    }
-
-    const user = new User(userData);
-    await user.save();
-
-    res.status(201).json({
-      message: 'Account created successfully',
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        referralCode: user.referralCode
-      }
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
-
-// Get all users by role
-router.get('/users/:role', auth, authorize('admin'), async (req, res) => {
-  try {
-    const { role } = req.params;
-    const { page = 1, limit = 20, search } = req.query;
-
-    let query = { role };
+    const { role, isActive, isVerified, page = 1, limit = 20, search } = req.query;
+    
+    let query = {};
+    if (role) query.role = role;
+    if (isActive !== undefined) query.isActive = isActive === 'true';
+    if (isVerified !== undefined) query.isVerified = isVerified === 'true';
+    
     if (search) {
+      const searchRegex = new RegExp(search, 'i');
       query.$or = [
-        { name: new RegExp(search, 'i') },
-        { email: new RegExp(search, 'i') }
+        { name: searchRegex },
+        { email: searchRegex },
+        { phone: searchRegex },
+        { businessName: searchRegex }
       ];
     }
 
     const users = await User.find(query)
       .select('-password')
+      .sort({ createdAt: -1 })
       .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .sort({ createdAt: -1 });
+      .skip((page - 1) * limit);
 
     const total = await User.countDocuments(query);
 
     res.json({
-      users,
-      totalPages: Math.ceil(total / limit),
-      currentPage: page
+      success: true,
+      data: users,
+      pagination: {
+        current: parseInt(page),
+        total: Math.ceil(total / limit),
+        count: users.length,
+        totalRecords: total
+      }
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Toggle user status (activate/deactivate)
-router.put('/users/:userId/toggle-status', auth, authorize('admin'), async (req, res) => {
+// GET user by ID
+router.get('/users/:id', ...adminOnly, async (req, res) => {
   try {
-    const user = await User.findById(req.params.userId);
+    const user = await User.findById(req.params.id).select('-password');
     if (!user) {
-      return res.status(404).json({ message: 'User not found' });
+      return res.status(404).json({ success: false, error: 'User not found' });
     }
 
-    user.isActive = !user.isActive;
+    // Get additional details based on user role
+    let additionalData = {};
+    if (user.role === 'pharmacy') {
+      additionalData.pharmacy = await Pharmacy.findOne({ owner: user._id });
+    } else if (user.role === 'vendor') {
+      additionalData.vendor = await Vendor.findOne({ owner: user._id });
+    }
+
+    res.json({ success: true, data: { ...user.toObject(), ...additionalData } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST create user
+router.post('/users', ...adminOnly, async (req, res) => {
+  try {
+    const userData = { ...req.body };
+    
+    // Check if email already exists
+    const existingUser = await User.findOne({ email: userData.email });
+    if (existingUser) {
+      return res.status(400).json({ success: false, error: 'Email already exists' });
+    }
+
+    const user = new User(userData);
     await user.save();
 
-    res.json({ 
-      message: `User ${user.isActive ? 'activated' : 'deactivated'} successfully`,
-      isActive: user.isActive
+    // Remove password from response
+    const userResponse = user.toObject();
+    delete userResponse.password;
+
+    res.status(201).json({ success: true, data: userResponse });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PUT update user
+router.put('/users/:id', ...adminOnly, async (req, res) => {
+  try {
+    const updateData = { ...req.body };
+    delete updateData.password; // Prevent password updates through this route
+
+    const user = await User.findByIdAndUpdate(
+      req.params.id,
+      updateData,
+      { new: true, runValidators: true }
+    ).select('-password');
+
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    res.json({ success: true, data: user });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PUT activate/deactivate user
+router.put('/users/:id/status', ...adminOnly, async (req, res) => {
+  try {
+    const { isActive } = req.body;
+    const user = await User.findByIdAndUpdate(
+      req.params.id,
+      { isActive },
+      { new: true }
+    ).select('-password');
+
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    res.json({ success: true, data: user });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PUT verify user
+router.put('/users/:id/verify', ...adminOnly, async (req, res) => {
+  try {
+    const user = await User.findByIdAndUpdate(
+      req.params.id,
+      { 
+        isVerified: true,
+        emailVerifiedAt: new Date()
+      },
+      { new: true }
+    ).select('-password');
+
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    res.json({ success: true, data: user });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE user
+router.delete('/users/:id', ...adminOnly, async (req, res) => {
+  try {
+    const user = await User.findByIdAndDelete(req.params.id);
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    // Also delete related pharmacy/vendor data
+    if (user.role === 'pharmacy') {
+      await Pharmacy.findOneAndDelete({ owner: user._id });
+    } else if (user.role === 'vendor') {
+      await Vendor.findOneAndDelete({ owner: user._id });
+    }
+
+    res.json({ success: true, message: 'User deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =================== PHARMACY MANAGEMENT ===================
+
+// GET all pharmacies
+router.get('/pharmacies', ...adminOnly, async (req, res) => {
+  try {
+    const { isActive, isVerified, cityId, page = 1, limit = 20, search } = req.query;
+    
+    let query = {};
+    if (isActive !== undefined) query.isActive = isActive === 'true';
+    if (isVerified !== undefined) query.isVerified = isVerified === 'true';
+    if (cityId) query.cityId = cityId;
+    
+    if (search) {
+      const searchRegex = new RegExp(search, 'i');
+      query.$or = [
+        { name: searchRegex },
+        { nameAr: searchRegex },
+        { phone: searchRegex },
+        { email: searchRegex },
+        { licenseNumber: searchRegex }
+      ];
+    }
+
+    const pharmacies = await Pharmacy.find(query)
+      .populate('owner', 'name email phone')
+      .sort({ createdAt: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+
+    const total = await Pharmacy.countDocuments(query);
+
+    res.json({
+      success: true,
+      data: pharmacies,
+      pagination: {
+        current: parseInt(page),
+        total: Math.ceil(total / limit),
+        count: pharmacies.length,
+        totalRecords: total
+      }
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Add medicine to big database with image upload
-router.post('/medicines', auth, authorize('admin'), uploadMedicine.single('medicineImage'), async (req, res) => {
+// PUT update pharmacy
+router.put('/pharmacies/:id', ...adminOnly, async (req, res) => {
   try {
-    const medicineData = req.body;
+    const pharmacy = await Pharmacy.findByIdAndUpdate(
+      req.params.id,
+      { ...req.body, updatedBy: req.user.id },
+      { new: true, runValidators: true }
+    ).populate('owner', 'name email');
 
-    // Handle image upload
-    if (req.file) {
-      medicineData.image = {
-        url: req.file.path,
-        publicId: req.file.filename
-      };
+    if (!pharmacy) {
+      return res.status(404).json({ success: false, error: 'Pharmacy not found' });
     }
 
-    const medicine = new Product(medicineData);
-    await medicine.save();
-
-    res.status(201).json({ message: 'Medicine added successfully', medicine });
+    res.json({ success: true, data: pharmacy });
   } catch (error) {
-    // Clean up uploaded image if database save fails
-    if (req.file) {
-      try {
-        await deleteImage(req.file.filename);
-      } catch (cleanupError) {
-        console.error('Error cleaning up uploaded image:', cleanupError);
-      }
-    }
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Update medicine with optional image update
-router.put('/medicines/:id', auth, authorize('admin'), uploadMedicine.single('medicineImage'), async (req, res) => {
+// PUT verify pharmacy
+router.put('/pharmacies/:id/verify', ...adminOnly, async (req, res) => {
   try {
-    const medicine = await Product.findById(req.params.id);
-    if (!medicine) {
-      return res.status(404).json({ message: 'Medicine not found' });
+    const pharmacy = await Pharmacy.findByIdAndUpdate(
+      req.params.id,
+      { 
+        isVerified: true,
+        verifiedAt: new Date(),
+        verifiedBy: req.user.id,
+        verificationStatus: 'verified'
+      },
+      { new: true }
+    );
+
+    if (!pharmacy) {
+      return res.status(404).json({ success: false, error: 'Pharmacy not found' });
     }
 
-    // Update basic fields
-    Object.keys(req.body).forEach(key => {
-      if (key !== 'image') {
-        medicine[key] = req.body[key];
+    res.json({ success: true, data: pharmacy });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE pharmacy
+router.delete('/pharmacies/:id', ...adminOnly, async (req, res) => {
+  try {
+    const pharmacy = await Pharmacy.findByIdAndDelete(req.params.id);
+    if (!pharmacy) {
+      return res.status(404).json({ success: false, error: 'Pharmacy not found' });
+    }
+
+    res.json({ success: true, message: 'Pharmacy deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =================== VENDOR MANAGEMENT ===================
+
+// GET all vendors
+router.get('/vendors', ...adminOnly, async (req, res) => {
+  try {
+    const { vendorType, isActive, isVerified, page = 1, limit = 20, search } = req.query;
+    
+    let query = {};
+    if (vendorType) query.vendorType = vendorType;
+    if (isActive !== undefined) query.isActive = isActive === 'true';
+    if (isVerified !== undefined) query.isVerified = isVerified === 'true';
+    
+    if (search) {
+      const searchRegex = new RegExp(search, 'i');
+      query.$or = [
+        { vendorName: searchRegex },
+        { vendorNameAr: searchRegex },
+        { phone: searchRegex },
+        { email: searchRegex },
+        { vendorCode: searchRegex }
+      ];
+    }
+
+    const vendors = await Vendor.find(query)
+      .sort({ createdAt: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+
+    const total = await Vendor.countDocuments(query);
+
+    res.json({
+      success: true,
+      data: vendors,
+      pagination: {
+        current: parseInt(page),
+        total: Math.ceil(total / limit),
+        count: vendors.length,
+        totalRecords: total
       }
     });
-
-    // Handle new image upload
-    if (req.file) {
-      // Delete old image if exists
-      if (medicine.image?.publicId) {
-        try {
-          await deleteImage(medicine.image.publicId);
-        } catch (error) {
-          console.error('Error deleting old medicine image:', error);
-        }
-      }
-
-      // Set new image
-      medicine.image = {
-        url: req.file.path,
-        publicId: req.file.filename
-      };
-    }
-
-    await medicine.save();
-
-    res.json({ message: 'Medicine updated successfully', medicine });
   } catch (error) {
-    // Clean up uploaded image if database save fails
-    if (req.file) {
-      try {
-        await deleteImage(req.file.filename);
-      } catch (cleanupError) {
-        console.error('Error cleaning up uploaded image:', cleanupError);
-      }
-    }
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Delete medicine image
-router.delete('/medicines/:id/image', auth, authorize('admin'), async (req, res) => {
+// POST create vendor
+router.post('/vendors', ...adminOnly, async (req, res) => {
   try {
-    const medicine = await Product.findById(req.params.id);
-    if (!medicine) {
-      return res.status(404).json({ message: 'Medicine not found' });
-    }
+    const vendor = new Vendor(req.body);
+    await vendor.save();
 
-    if (!medicine.image?.publicId) {
-      return res.status(400).json({ message: 'No image to delete' });
-    }
-
-    // Delete from Cloudinary
-    await deleteImage(medicine.image.publicId);
-
-    // Remove from medicine document
-    medicine.image = undefined;
-    await medicine.save();
-
-    res.json({ message: 'Medicine image deleted successfully' });
+    res.status(201).json({ success: true, data: vendor });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Delete medicine completely
-router.delete('/medicines/:id', auth, authorize('admin'), async (req, res) => {
+// PUT update vendor
+router.put('/vendors/:id', ...adminOnly, async (req, res) => {
   try {
-    const medicine = await Product.findById(req.params.id);
-    if (!medicine) {
-      return res.status(404).json({ message: 'Medicine not found' });
+    const vendor = await Vendor.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      { new: true, runValidators: true }
+    );
+
+    if (!vendor) {
+      return res.status(404).json({ success: false, error: 'Vendor not found' });
     }
 
-    // Delete image from Cloudinary if exists
-    if (medicine.image?.publicId) {
-      try {
-        await deleteImage(medicine.image.publicId);
-      } catch (error) {
-        console.error('Error deleting medicine image:', error);
-      }
-    }
-
-    await Product.findByIdAndDelete(req.params.id);
-
-    res.json({ message: 'Medicine deleted successfully' });
+    res.json({ success: true, data: vendor });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Bulk upload medicines with images (for CSV imports, etc.)
-router.post('/medicines/bulk-upload', auth, authorize('admin'), uploadMedicine.array('images'), async (req, res) => {
+// PUT verify vendor
+router.put('/vendors/:id/verify', ...adminOnly, async (req, res) => {
   try {
-    const { medicines } = req.body; // Array of medicine data
-    let parsedMedicines;
+    const vendor = await Vendor.findByIdAndUpdate(
+      req.params.id,
+      { 
+        isVerified: true,
+        verifiedAt: new Date(),
+        verifiedBy: req.user.id
+      },
+      { new: true }
+    );
 
-    try {
-      parsedMedicines = JSON.parse(medicines);
-    } catch (error) {
-      return res.status(400).json({ message: 'Invalid medicines data format' });
+    if (!vendor) {
+      return res.status(404).json({ success: false, error: 'Vendor not found' });
     }
 
-    const results = {
-      success: [],
-      failed: [],
-      total: parsedMedicines.length
-    };
+    res.json({ success: true, data: vendor });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
-    // Map images by their original names or indices
-    const imageMap = new Map();
-    if (req.files) {
-      req.files.forEach((file, index) => {
-        imageMap.set(file.originalname, {
-          url: file.path,
-          publicId: file.filename
-        });
-        imageMap.set(index.toString(), {
-          url: file.path,
-          publicId: file.filename
-        });
+// DELETE vendor
+router.delete('/vendors/:id', ...adminOnly, async (req, res) => {
+  try {
+    const vendor = await Vendor.findByIdAndDelete(req.params.id);
+    if (!vendor) {
+      return res.status(404).json({ success: false, error: 'Vendor not found' });
+    }
+
+    res.json({ success: true, message: 'Vendor deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =================== LOCATION MANAGEMENT ===================
+
+// GET all governorates
+router.get('/governorates', ...adminOnly, async (req, res) => {
+  try {
+    const governorates = await Governorate.find().sort({ nameEn: 1 });
+    res.json({ success: true, data: governorates });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST create governorate
+router.post('/governorates', ...adminOnly, async (req, res) => {
+  try {
+    const governorate = new Governorate(req.body);
+    await governorate.save();
+
+    res.status(201).json({ success: true, data: governorate });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PUT enable/disable governorate
+router.put('/governorates/:id/toggle', ...adminOnly, async (req, res) => {
+  try {
+    const governorate = await Governorate.findById(req.params.id);
+    if (!governorate) {
+      return res.status(404).json({ success: false, error: 'Governorate not found' });
+    }
+
+    if (governorate.isEnabled) {
+      governorate.disable();
+    } else {
+      governorate.enable(req.user.id);
+    }
+
+    await governorate.save();
+    res.json({ success: true, data: governorate });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET all cities
+router.get('/cities', ...adminOnly, async (req, res) => {
+  try {
+    const { governorateId } = req.query;
+    let query = {};
+    if (governorateId) query.governorateId = governorateId;
+
+    const cities = await City.find(query)
+      .populate('governorateId', 'nameEn nameAr')
+      .sort({ nameEn: 1 });
+
+    res.json({ success: true, data: cities });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST create city
+router.post('/cities', ...adminOnly, async (req, res) => {
+  try {
+    const city = new City({ 
+      ...req.body,
+      enabledBy: req.user.id 
+    });
+    await city.save();
+
+    res.status(201).json({ success: true, data: city });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PUT enable/disable city
+router.put('/cities/:id/toggle', ...adminOnly, async (req, res) => {
+  try {
+    const city = await City.findById(req.params.id);
+    if (!city) {
+      return res.status(404).json({ success: false, error: 'City not found' });
+    }
+
+    if (city.isEnabled) {
+      city.disable();
+    } else {
+      city.enable(req.user.id);
+    }
+
+    await city.save();
+    res.json({ success: true, data: city });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =================== ADMIN SETTINGS ===================
+
+// GET admin settings
+router.get('/settings', ...adminOnly, async (req, res) => {
+  try {
+    let settings = await AdminSettings.findOne();
+    
+    if (!settings) {
+      // Create default settings if none exist
+      settings = new AdminSettings({
+        enabledGovernorateIds: ['ismailia'],
+        enabledCityIds: ['ismailia-city'],
+        defaultCity: 'ismailia-city',
+        updatedBy: req.user.id
+      });
+      await settings.save();
+    }
+
+    res.json({ success: true, data: settings });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PUT update admin settings
+router.put('/settings', ...adminOnly, async (req, res) => {
+  try {
+    let settings = await AdminSettings.findOne();
+    
+    if (!settings) {
+      settings = new AdminSettings({
+        ...req.body,
+        updatedBy: req.user.id
+      });
+    } else {
+      Object.assign(settings, {
+        ...req.body,
+        lastUpdated: new Date(),
+        updatedBy: req.user.id
       });
     }
 
-    for (let i = 0; i < parsedMedicines.length; i++) {
-      try {
-        const medicineData = parsedMedicines[i];
+    await settings.save();
 
-        // Assign image if available
-        if (medicineData.imageIndex !== undefined) {
-          const image = imageMap.get(medicineData.imageIndex.toString());
-          if (image) {
-            medicineData.image = image;
-          }
-        } else if (medicineData.imageName) {
-          const image = imageMap.get(medicineData.imageName);
-          if (image) {
-            medicineData.image = image;
-          }
-        }
-
-        const medicine = new Product(medicineData);
-        await medicine.save();
-        
-        results.success.push({
-          index: i,
-          name: medicine.name,
-          id: medicine._id
-        });
-      } catch (error) {
-        results.failed.push({
-          index: i,
-          name: parsedMedicines[i].name || 'Unknown',
-          error: error.message
-        });
-      }
-    }
-
-    res.json({
-      message: 'Bulk upload completed',
-      results
-    });
+    res.json({ success: true, data: settings });
   } catch (error) {
-    // Clean up all uploaded images if bulk operation fails
-    if (req.files) {
-      for (const file of req.files) {
-        try {
-          await deleteImage(file.filename);
-        } catch (cleanupError) {
-          console.error('Error cleaning up uploaded image:', cleanupError);
-        }
-      }
-    }
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Verify pharmacy
-router.put('/pharmacies/:id/verify', auth, authorize('admin'), async (req, res) => {
-  try {
-    const pharmacy = await Pharmacy.findById(req.params.id);
-    if (!pharmacy) {
-      return res.status(404).json({ message: 'Pharmacy not found' });
-    }
+// =================== ANALYTICS AND REPORTS ===================
 
-    pharmacy.isVerified = true;
-    await pharmacy.save();
-
-    res.json({ message: 'Pharmacy verified successfully' });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
-
-// Verify vendor
-router.put('/vendors/:id/verify', auth, authorize('admin'), async (req, res) => {
-  try {
-    const vendor = await Vendor.findById(req.params.id);
-    if (!vendor) {
-      return res.status(404).json({ message: 'Vendor not found' });
-    }
-
-    vendor.isVerified = true;
-    await vendor.save();
-
-    res.json({ message: 'Vendor verified successfully' });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
-
-// Dashboard statistics
-router.get('/dashboard-stats', auth, authorize('admin'), async (req, res) => {
+// GET dashboard analytics
+router.get('/analytics/dashboard', ...adminOnly, async (req, res) => {
   try {
     const [
       totalUsers,
       totalPharmacies,
       totalVendors,
-      totalMedicines,
-      totalOrders,
-      totalPrescriptions,
-      recentOrders,
-      pendingPrescriptions
+      activeUsers,
+      verifiedPharmacies,
+      verifiedVendors
     ] = await Promise.all([
-      User.countDocuments({ role: { $in: ['customer', 'pharmacy', 'vendor', 'doctor'] } }),
+      User.countDocuments(),
       Pharmacy.countDocuments(),
       Vendor.countDocuments(),
-      Product.countDocuments({ isActive: true }),
-      Order.countDocuments(),
-      Prescription.countDocuments(),
-      Order.find().populate('customer', 'name profileImage').sort({ createdAt: -1 }).limit(10),
-      Prescription.find({ status: { $in: ['uploaded', 'reading'] } })
-        .populate('customer', 'name profileImage').sort({ createdAt: -1 }).limit(10)
+      User.countDocuments({ isActive: true }),
+      Pharmacy.countDocuments({ isVerified: true }),
+      Vendor.countDocuments({ isVerified: true })
     ]);
 
-    const stats = {
-      totalUsers,
-      totalPharmacies,
-      totalVendors,
-      totalMedicines,
-      totalOrders,
-      totalPrescriptions,
-      recentOrders,
-      pendingPrescriptions
+    // User distribution by role
+    const usersByRole = await User.aggregate([
+      { $group: { _id: '$role', count: { $sum: 1 } } }
+    ]);
+
+    // Recent registrations (last 30 days)
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    const recentRegistrations = await User.countDocuments({
+      createdAt: { $gte: thirtyDaysAgo }
+    });
+
+    const analytics = {
+      overview: {
+        totalUsers,
+        totalPharmacies,
+        totalVendors,
+        activeUsers,
+        verifiedPharmacies,
+        verifiedVendors,
+        recentRegistrations
+      },
+      usersByRole: usersByRole.reduce((acc, item) => {
+        acc[item._id] = item.count;
+        return acc;
+      }, {}),
+      verificationRates: {
+        pharmacies: totalPharmacies > 0 ? (verifiedPharmacies / totalPharmacies) * 100 : 0,
+        vendors: totalVendors > 0 ? (verifiedVendors / totalVendors) * 100 : 0
+      }
     };
 
-    res.json(stats);
+    res.json({ success: true, data: analytics });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
-
-// Get all orders (admin view)
-router.get('/orders', auth, authorize('admin'), async (req, res) => {
-  try {
-    const { page = 1, limit = 20, status } = req.query;
-    let query = {};
-
-    if (status) {
-      query.overallStatus = status;
-    }
-
-    const orders = await Order.find(query)
-      .populate('customer', 'name email phone profileImage')
-      .populate('items.medicine', 'name brand image')
-      .populate('pharmacyOrders.pharmacy', 'name')
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .sort({ createdAt: -1 });
-
-    const total = await Order.countDocuments(query);
-
-    res.json({
-      orders,
-      totalPages: Math.ceil(total / limit),
-      currentPage: page
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
-
-// Get all prescriptions (admin view)
-router.get('/prescriptions', auth, authorize('admin'), async (req, res) => {
-  try {
-    const { page = 1, limit = 20, status } = req.query;
-    let query = {};
-
-    if (status) {
-      query.status = status;
-    }
-
-    const prescriptions = await Prescription.find(query)
-      .populate('customer', 'name email phone profileImage')
-      .populate('prescriptionReader', 'name profileImage')
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .sort({ createdAt: -1 });
-
-    const total = await Prescription.countDocuments(query);
-
-    res.json({
-      prescriptions,
-      totalPages: Math.ceil(total / limit),
-      currentPage: page
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
-
-// Admin: Get user credit statistics
-router.get('/credits/stats', auth, authorize('admin'), async (req, res) => {
-  try {
-    const stats = await User.aggregate([
-      { $match: { role: 'customer' } },
-      {
-        $group: {
-          _id: null,
-          totalUsers: { $sum: 1 },
-          totalCredits: { $sum: '$credits' },
-          averageCredits: { $avg: '$credits' },
-          maxCredits: { $max: '$credits' },
-          usersWithCredits: {
-            $sum: {
-              $cond: [{ $gt: ['$credits', 0] }, 1, 0]
-            }
-          }
-        }
-      }
-    ]);
-
-    // Get top credit holders
-    const topUsers = await User.find({ role: 'customer' })
-      .sort({ credits: -1 })
-      .limit(10)
-      .select('name email credits profileImage');
-
-    res.json({
-      stats: stats[0] || {
-        totalUsers: 0,
-        totalCredits: 0,
-        averageCredits: 0,
-        maxCredits: 0,
-        usersWithCredits: 0
-      },
-      topUsers
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 

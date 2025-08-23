@@ -45,7 +45,7 @@ app.set('io', io);
 
 // Routes
 app.use('/api/auth', require('./routes/auth'));
-app.use('/api/users', require('./routes/user'));
+// app.use('/api/users', require('./routes/user'));
 app.use('/api/products', require('./routes/product'));
 app.use('/api/pharmacies', require('./routes/pharmacies'));
 app.use('/api/prescriptions', require('./routes/prescription'));

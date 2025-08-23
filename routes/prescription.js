@@ -1,313 +1,444 @@
 const express = require('express');
-const Prescription = require('../models/Prescription');
-const { auth, authorize } = require('../middleware/auth');
-const { uploadPrescription, deleteImage } = require('../config/cloudinary');
-
 const router = express.Router();
+const Prescription = require('../models/Prescription');
+const { authenticateToken, authorizeRoles } = require('../middleware/auth');
+const multer = require('multer');
 
-// Upload prescription (customer) with Cloudinary
-router.post('/upload', auth, authorize('customer'), uploadPrescription.array('prescriptions', 10), async (req, res) => {
+// Configure multer for file uploads
+const upload = multer({
+  dest: 'uploads/prescriptions/',
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/') || file.mimetype === 'application/pdf') {
+      cb(null, true);
+    } else {
+      cb(new Error('Only images and PDFs are allowed'), false);
+    }
+  },
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+});
+
+// Workflow configuration
+const PRESCRIPTION_WORKFLOW_STEPS = {
+  submitted: {
+    status: 'submitted',
+    title: 'Prescription Submitted',
+    allowedRoles: ['customer'],
+    nextSteps: ['reviewing', 'approved', 'cancelled', 'suspended'],
+    estimatedDuration: 0,
+  },
+  reviewing: {
+    status: 'reviewing',
+    title: 'Under Review',
+    allowedRoles: ['prescription-reader', 'pharmacy', 'admin'],
+    nextSteps: ['approved', 'rejected', 'suspended'],
+    estimatedDuration: 2,
+  },
+  approved: {
+    status: 'approved',
+    title: 'Prescription Approved',
+    allowedRoles: ['prescription-reader', 'pharmacy', 'admin'],
+    nextSteps: ['cancelled'],
+    estimatedDuration: 0,
+  },
+  rejected: {
+    status: 'rejected',
+    title: 'Prescription Rejected',
+    allowedRoles: ['prescription-reader', 'pharmacy', 'admin'],
+    nextSteps: ['submitted'],
+    estimatedDuration: 0,
+  },
+  cancelled: {
+    status: 'cancelled',
+    title: 'Cancelled',
+    allowedRoles: ['customer', 'pharmacy', 'admin'],
+    nextSteps: [],
+    estimatedDuration: 0,
+  },
+  suspended: {
+    status: 'suspended',
+    title: 'Suspended',
+    allowedRoles: ['prescription-reader', 'pharmacy', 'admin'],
+    nextSteps: ['reviewing', 'approved', 'rejected'],
+    estimatedDuration: 4,
+  }
+};
+
+const URGENCY_TIME_MULTIPLIERS = {
+  routine: 1.5,
+  normal: 1.0,
+  urgent: 0.5
+};
+
+// Helper functions
+const calculateEstimatedCompletion = (currentStatus, urgency, startTime = new Date()) => {
+  const step = PRESCRIPTION_WORKFLOW_STEPS[currentStatus];
+  const baseHours = step.estimatedDuration;
+  const multiplier = URGENCY_TIME_MULTIPLIERS[urgency];
+  const adjustedHours = baseHours * multiplier;
+
+  const completion = new Date(startTime);
+  completion.setHours(completion.getHours() + adjustedHours);
+  return completion;
+};
+
+const canTransitionTo = (currentStatus, newStatus, userRole) => {
+  const currentStep = PRESCRIPTION_WORKFLOW_STEPS[currentStatus];
+  const newStep = PRESCRIPTION_WORKFLOW_STEPS[newStatus];
+
+  return currentStep.nextSteps.includes(newStatus) && 
+         newStep.allowedRoles.includes(userRole);
+};
+
+// GET all prescriptions
+router.get('/', authenticateToken, async (req, res) => {
   try {
-    if (!req.files || req.files.length === 0) {
-      return res.status(400).json({ message: 'At least one prescription image is required' });
+    const { status, urgency, customerId, assignedReaderId, page = 1, limit = 20 } = req.query;
+    
+    let query = {};
+    
+    // Role-based filtering
+    if (req.user.role === 'customer') {
+      query.customerId = req.user.id;
+    } else if (req.user.role === 'prescription-reader') {
+      query.assignedReaderId = req.user.id;
+    } else if (req.user.role === 'pharmacy') {
+      query.assignedPharmacyId = req.user.id;
     }
 
-    // Process uploaded files
-    const prescriptionImages = req.files.map(file => ({
-      url: file.path,
-      publicId: file.filename,
-      originalName: file.originalname
-    }));
+    // Apply filters
+    if (status) query.currentStatus = status;
+    if (urgency) query.urgency = urgency;
+    if (customerId && ['admin', 'prescription-reader'].includes(req.user.role)) {
+      query.customerId = customerId;
+    }
+    if (assignedReaderId && req.user.role === 'admin') {
+      query.assignedReaderId = assignedReaderId;
+    }
 
-    const { isUrgent = false } = req.body;
+    const prescriptions = await Prescription.find(query)
+      .populate('customerId', 'name phone email')
+      .populate('assignedPharmacyId', 'businessName phone')
+      .populate('assignedReaderId', 'name')
+      .sort({ createdAt: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
 
-    const prescription = new Prescription({
-      customer: req.user._id,
-      prescriptionImages,
-      isUrgent: JSON.parse(isUrgent)
-    });
+    const total = await Prescription.countDocuments(query);
 
-    await prescription.save();
-
-    // Emit real-time notification to prescription readers
-    const io = req.app.get('io');
-    io.to('prescription_readers').emit('new_prescription', {
-      id: prescription._id,
-      customer: req.user.name,
-      isUrgent: prescription.isUrgent,
-      imageCount: prescriptionImages.length,
-      createdAt: prescription.createdAt
-    });
-
-    res.status(201).json({
-      message: 'Prescription uploaded successfully',
-      prescription: {
-        id: prescription._id,
-        status: prescription.status,
-        imageCount: prescriptionImages.length,
-        isUrgent: prescription.isUrgent
+    res.json({
+      success: true,
+      data: prescriptions,
+      pagination: {
+        current: parseInt(page),
+        total: Math.ceil(total / limit),
+        count: prescriptions.length,
+        totalRecords: total
       }
     });
   } catch (error) {
-    // Clean up uploaded files if database save fails
-    if (req.files) {
-      for (const file of req.files) {
-        try {
-          await deleteImage(file.filename);
-        } catch (cleanupError) {
-          console.error('Error cleaning up uploaded file:', cleanupError);
-        }
-      }
-    }
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Delete prescription image (customer only, before processing)
-router.delete('/:id/images/:imageIndex', auth, authorize('customer'), async (req, res) => {
-  try {
-    const { id, imageIndex } = req.params;
-    const index = parseInt(imageIndex);
-
-    const prescription = await Prescription.findById(id);
-    if (!prescription) {
-      return res.status(404).json({ message: 'Prescription not found' });
-    }
-
-    if (prescription.customer.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
-
-    if (prescription.status !== 'uploaded') {
-      return res.status(400).json({ message: 'Cannot modify prescription after processing has started' });
-    }
-
-    if (index < 0 || index >= prescription.prescriptionImages.length) {
-      return res.status(400).json({ message: 'Invalid image index' });
-    }
-
-    if (prescription.prescriptionImages.length <= 1) {
-      return res.status(400).json({ message: 'Cannot delete the last prescription image' });
-    }
-
-    const imageToDelete = prescription.prescriptionImages[index];
-
-    // Delete from Cloudinary
-    try {
-      await deleteImage(imageToDelete.publicId);
-    } catch (error) {
-      console.error('Error deleting image from Cloudinary:', error);
-    }
-
-    // Remove from prescription
-    prescription.prescriptionImages.splice(index, 1);
-    await prescription.save();
-
-    res.json({ message: 'Prescription image deleted successfully' });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
-
-// Add more prescription images (customer only, before processing)
-router.post('/:id/add-images', auth, authorize('customer'), uploadPrescription.array('prescriptions', 5), async (req, res) => {
-  try {
-    if (!req.files || req.files.length === 0) {
-      return res.status(400).json({ message: 'At least one prescription image is required' });
-    }
-
-    const prescription = await Prescription.findById(req.params.id);
-    if (!prescription) {
-      return res.status(404).json({ message: 'Prescription not found' });
-    }
-
-    if (prescription.customer.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
-
-    if (prescription.status !== 'uploaded') {
-      return res.status(400).json({ message: 'Cannot modify prescription after processing has started' });
-    }
-
-    if (prescription.prescriptionImages.length + req.files.length > 10) {
-      return res.status(400).json({ message: 'Maximum 10 images allowed per prescription' });
-    }
-
-    // Process new uploaded files
-    const newImages = req.files.map(file => ({
-      url: file.path,
-      publicId: file.filename,
-      originalName: file.originalname
-    }));
-
-    prescription.prescriptionImages.push(...newImages);
-    await prescription.save();
-
-    res.json({ 
-      message: 'Images added successfully',
-      totalImages: prescription.prescriptionImages.length
-    });
-  } catch (error) {
-    // Clean up uploaded files if database save fails
-    if (req.files) {
-      for (const file of req.files) {
-        try {
-          await deleteImage(file.filename);
-        } catch (cleanupError) {
-          console.error('Error cleaning up uploaded file:', cleanupError);
-        }
-      }
-    }
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
-
-// Get prescription queue (prescription readers)
-router.get('/queue', auth, authorize('prescription_reader'), async (req, res) => {
-  try {
-    const prescriptions = await Prescription.find({
-      status: { $in: ['uploaded', 'reading'] }
-    })
-    .populate('customer', 'name phone email profileImage')
-    .sort({ isUrgent: -1, createdAt: 1 });
-
-    res.json(prescriptions);
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
-
-// Start reading prescription
-router.put('/:id/start-reading', auth, authorize('prescription_reader'), async (req, res) => {
-  try {
-    const prescription = await Prescription.findById(req.params.id);
-    if (!prescription) {
-      return res.status(404).json({ message: 'Prescription not found' });
-    }
-
-    if (prescription.status !== 'uploaded') {
-      return res.status(400).json({ message: 'Prescription is not available for reading' });
-    }
-
-    prescription.status = 'reading';
-    prescription.prescriptionReader = req.user._id;
-    prescription.readingStartedAt = new Date();
-    
-    await prescription.save();
-
-    res.json({ message: 'Prescription reading started', prescription });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
-
-// Process prescription (add medicines and alternatives)
-router.put('/:id/process', auth, authorize('prescription_reader'), async (req, res) => {
-  try {
-    const { medicines, readerNotes } = req.body;
-    
-    const prescription = await Prescription.findById(req.params.id);
-    if (!prescription) {
-      return res.status(404).json({ message: 'Prescription not found' });
-    }
-
-    if (prescription.status !== 'reading' || prescription.prescriptionReader.toString() !== req.user._id.toString()) {
-      return res.status(400).json({ message: 'Unauthorized to process this prescription' });
-    }
-
-    prescription.medicines = medicines;
-    prescription.readerNotes = readerNotes;
-    prescription.status = 'processed';
-    prescription.processedAt = new Date();
-    
-    await prescription.save();
-
-    // Notify customer that prescription is ready
-    const io = req.app.get('io');
-    io.to(`customer_${prescription.customer}`).emit('prescription_processed', {
-      prescriptionId: prescription._id,
-      message: 'Your prescription has been processed and is ready for ordering'
-    });
-
-    res.json({ message: 'Prescription processed successfully', prescription });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
-
-// Get customer's prescriptions
-router.get('/my-prescriptions', auth, authorize('customer'), async (req, res) => {
-  try {
-    const prescriptions = await Prescription.find({ customer: req.user._id })
-      .populate('medicines.medicine', 'name brand strength form image')
-      .populate('medicines.alternatives', 'name brand strength form image')
-      .sort({ createdAt: -1 });
-
-    res.json(prescriptions);
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
-
-// Get specific prescription details
-router.get('/:id', auth, async (req, res) => {
+// GET prescription by ID
+router.get('/:id', authenticateToken, async (req, res) => {
   try {
     const prescription = await Prescription.findById(req.params.id)
-      .populate('customer', 'name phone email profileImage')
-      .populate('prescriptionReader', 'name profileImage')
-      .populate('medicines.medicine', 'name brand strength form category image')
-      .populate('medicines.alternatives', 'name brand strength form category image');
+      .populate('customerId', 'name phone email')
+      .populate('assignedPharmacyId', 'businessName phone')
+      .populate('assignedReaderId', 'name');
 
     if (!prescription) {
-      return res.status(404).json({ message: 'Prescription not found' });
+      return res.status(404).json({ success: false, error: 'Prescription not found' });
     }
 
     // Check authorization
-    const isCustomer = req.user.role === 'customer' && prescription.customer._id.toString() === req.user._id.toString();
-    const isReader = req.user.role === 'prescription_reader';
-    const isAdmin = req.user.role === 'admin';
+    const isAuthorized = 
+      req.user.role === 'admin' ||
+      prescription.customerId._id.toString() === req.user.id ||
+      prescription.assignedPharmacyId?.toString() === req.user.id ||
+      prescription.assignedReaderId?.toString() === req.user.id;
 
-    if (!isCustomer && !isReader && !isAdmin) {
-      return res.status(403).json({ message: 'Access denied' });
+    if (!isAuthorized) {
+      return res.status(403).json({ success: false, error: 'Not authorized to view this prescription' });
     }
 
-    res.json(prescription);
+    res.json({ success: true, data: prescription });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Delete prescription (customer only, before processing starts)
-router.delete('/:id', auth, authorize('customer'), async (req, res) => {
+// GET prescriptions by customer ID
+router.get('/customer/:customerId', authenticateToken, authorizeRoles(['admin', 'prescription-reader']), async (req, res) => {
   try {
+    const prescriptions = await Prescription.find({ customerId: req.params.customerId })
+      .populate('assignedPharmacyId', 'businessName')
+      .sort({ createdAt: -1 });
+
+    res.json({ success: true, data: prescriptions });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET prescriptions by status
+router.get('/status/:status', authenticateToken, async (req, res) => {
+  try {
+    let query = { currentStatus: req.params.status };
+
+    // Apply role-based filtering
+    if (req.user.role === 'customer') {
+      query.customerId = req.user.id;
+    } else if (req.user.role === 'prescription-reader') {
+      query.assignedReaderId = req.user.id;
+    } else if (req.user.role === 'pharmacy') {
+      query.assignedPharmacyId = req.user.id;
+    }
+
+    const prescriptions = await Prescription.find(query)
+      .populate('customerId', 'name phone')
+      .populate('assignedPharmacyId', 'businessName')
+      .sort({ createdAt: -1 });
+
+    res.json({ success: true, data: prescriptions });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST create new prescription (customer only)
+router.post('/', authenticateToken, authorizeRoles(['customer']), upload.array('files', 5), async (req, res) => {
+  try {
+    const files = req.files ? req.files.map(file => ({
+      filename: file.filename,
+      originalName: file.originalname,
+      url: `/uploads/prescriptions/${file.filename}`,
+      type: file.mimetype.startsWith('image/') ? 'image' : 'pdf',
+      size: file.size
+    })) : [];
+
+    const prescriptionData = {
+      ...req.body,
+      customerId: req.user.id,
+      customerName: req.user.name,
+      customerPhone: req.user.phone,
+      files,
+      currentStatus: 'submitted',
+      estimatedCompletion: calculateEstimatedCompletion('submitted', req.body.urgency || 'normal')
+    };
+
+    const prescription = new Prescription(prescriptionData);
+    await prescription.save();
+
+    res.status(201).json({ success: true, data: prescription });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PUT update prescription status
+router.put('/:id/status', authenticateToken, async (req, res) => {
+  try {
+    const { newStatus, notes } = req.body;
+    const prescription = await Prescription.findById(req.params.id);
+
+    if (!prescription) {
+      return res.status(404).json({ success: false, error: 'Prescription not found' });
+    }
+
+    // Check if transition is allowed
+    if (!canTransitionTo(prescription.currentStatus, newStatus, req.user.role)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: `Cannot transition from ${prescription.currentStatus} to ${newStatus} with role ${req.user.role}` 
+      });
+    }
+
+    // Update status
+    prescription.currentStatus = newStatus;
+    prescription.statusHistory.push({
+      status: newStatus,
+      timestamp: new Date(),
+      userId: req.user.id,
+      userRole: req.user.role,
+      userName: req.user.name,
+      notes: notes || `Status updated to ${newStatus}`
+    });
+
+    // Update estimated completion if needed
+    if (['reviewing', 'submitted'].includes(newStatus)) {
+      prescription.estimatedCompletion = calculateEstimatedCompletion(
+        newStatus,
+        prescription.urgency
+      );
+    }
+
+    if (newStatus === 'approved') {
+      prescription.actualCompletion = new Date();
+    }
+
+    await prescription.save();
+
+    res.json({ success: true, data: prescription });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PUT assign prescription to pharmacy/reader
+router.put('/:id/assign', authenticateToken, authorizeRoles(['admin', 'prescription-reader']), async (req, res) => {
+  try {
+    const { assignedPharmacyId, assignedReaderId, assignedPharmacistId } = req.body;
+    
     const prescription = await Prescription.findById(req.params.id);
     if (!prescription) {
-      return res.status(404).json({ message: 'Prescription not found' });
+      return res.status(404).json({ success: false, error: 'Prescription not found' });
     }
 
-    if (prescription.customer.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
+    if (assignedPharmacyId) prescription.assignedPharmacyId = assignedPharmacyId;
+    if (assignedReaderId) prescription.assignedReaderId = assignedReaderId;
+    if (assignedPharmacistId) prescription.assignedPharmacistId = assignedPharmacistId;
 
-    if (prescription.status !== 'uploaded') {
-      return res.status(400).json({ message: 'Cannot delete prescription after processing has started' });
-    }
+    prescription.statusHistory.push({
+      status: prescription.currentStatus,
+      timestamp: new Date(),
+      userId: req.user.id,
+      userRole: req.user.role,
+      userName: req.user.name,
+      notes: 'Prescription assigned'
+    });
 
-    // Delete all images from Cloudinary
-    for (const image of prescription.prescriptionImages) {
-      try {
-        await deleteImage(image.publicId);
-      } catch (error) {
-        console.error('Error deleting prescription image:', error);
-      }
-    }
+    await prescription.save();
 
-    // Delete prescription document
-    await Prescription.findByIdAndDelete(req.params.id);
-
-    res.json({ message: 'Prescription deleted successfully' });
+    res.json({ success: true, data: prescription });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PUT add processed medicines
+router.put('/:id/medicines', authenticateToken, authorizeRoles(['prescription-reader', 'pharmacy', 'admin']), async (req, res) => {
+  try {
+    const { processedMedicines } = req.body;
+    
+    const prescription = await Prescription.findById(req.params.id);
+    if (!prescription) {
+      return res.status(404).json({ success: false, error: 'Prescription not found' });
+    }
+
+    prescription.processedMedicines = processedMedicines;
+    prescription.totalAmount = processedMedicines.reduce((sum, med) => sum + (med.price * med.quantity), 0);
+
+    await prescription.save();
+
+    res.json({ success: true, data: prescription });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST search prescriptions
+router.post('/search', authenticateToken, async (req, res) => {
+  try {
+    const { query } = req.body;
+    let searchQuery = {};
+
+    // Role-based base query
+    if (req.user.role === 'customer') {
+      searchQuery.customerId = req.user.id;
+    } else if (req.user.role === 'prescription-reader') {
+      searchQuery.assignedReaderId = req.user.id;
+    } else if (req.user.role === 'pharmacy') {
+      searchQuery.assignedPharmacyId = req.user.id;
+    }
+
+    // Add search criteria
+    if (query) {
+      const searchRegex = new RegExp(query, 'i');
+      searchQuery.$or = [
+        { prescriptionNumber: searchRegex },
+        { customerName: searchRegex },
+        { customerPhone: searchRegex },
+        { patientName: searchRegex },
+        { doctorName: searchRegex },
+        { hospitalClinic: searchRegex }
+      ];
+    }
+
+    const prescriptions = await Prescription.find(searchQuery)
+      .populate('customerId', 'name phone')
+      .populate('assignedPharmacyId', 'businessName')
+      .sort({ createdAt: -1 });
+
+    res.json({ success: true, data: prescriptions });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET prescription analytics
+router.get('/analytics/summary', authenticateToken, authorizeRoles(['admin', 'prescription-reader']), async (req, res) => {
+  try {
+    const total = await Prescription.countDocuments();
+    
+    const statusCounts = await Prescription.aggregate([
+      { $group: { _id: '$currentStatus', count: { $sum: 1 } } }
+    ]);
+
+    const urgencyCounts = await Prescription.aggregate([
+      { $group: { _id: '$urgency', count: { $sum: 1 } } }
+    ]);
+
+    const completedPrescriptions = await Prescription.find({ 
+      currentStatus: 'approved',
+      actualCompletion: { $exists: true }
+    });
+
+    let averageProcessingTime = 0;
+    if (completedPrescriptions.length > 0) {
+      const totalTime = completedPrescriptions.reduce((sum, prescription) => {
+        const start = new Date(prescription.createdAt).getTime();
+        const end = new Date(prescription.actualCompletion).getTime();
+        return sum + (end - start);
+      }, 0);
+      averageProcessingTime = totalTime / completedPrescriptions.length / (1000 * 60 * 60); // Convert to hours
+    }
+
+    const approvedCount = await Prescription.countDocuments({ currentStatus: 'approved' });
+    const completionRate = total > 0 ? (approvedCount / total) * 100 : 0;
+
+    const analytics = {
+      total,
+      statusCounts: statusCounts.reduce((acc, item) => {
+        acc[item._id] = item.count;
+        return acc;
+      }, {}),
+      urgencyCounts: urgencyCounts.reduce((acc, item) => {
+        acc[item._id] = item.count;
+        return acc;
+      }, {}),
+      averageProcessingTime,
+      completionRate
+    };
+
+    res.json({ success: true, data: analytics });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// DELETE prescription (admin only)
+router.delete('/:id', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const prescription = await Prescription.findByIdAndDelete(req.params.id);
+    if (!prescription) {
+      return res.status(404).json({ success: false, error: 'Prescription not found' });
+    }
+
+    res.json({ success: true, message: 'Prescription deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 

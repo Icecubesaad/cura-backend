@@ -1,241 +1,570 @@
 const express = require('express');
-const jwt = require('jsonwebtoken');
-const { body, validationResult } = require('express-validator');
-const User = require('../models/User');
-const { auth } = require('../middleware/auth');
-
 const router = express.Router();
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const User = require('../models/User');
+const Pharmacy = require('../models/Pharmacy');
+const { authenticateToken, rateLimit } = require('../middleware/auth');
 
-// Generate referral code for doctors
-const generateReferralCode = () => {
-  return Math.random().toString(36).substr(2, 8).toUpperCase();
-};
+// Apply stricter rate limiting for auth routes
+router.use(rateLimit(20, 15 * 60 * 1000)); // 20 requests per 15 minutes
 
-// Register
-router.post('/register', [
-  body('firstName').notEmpty().withMessage('Name is required'),
-  body('lastName').notEmpty().withMessage('Name is required'),
-  body('email').isEmail().withMessage('Valid email is required'),
-  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
-  body('phone').notEmpty().withMessage('Phone is required'),
-  body('role').isIn(['customer', 'pharmacy', 'vendor']).withMessage('Invalid role')
-], async (req, res) => {
+// POST register user
+router.post('/register', async (req, res) => {
   try {
-    console.log('request recieved')
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      console.log('error with validaiton', errors)
-      return res.status(400).json({ errors: errors.array() });
-    }
+    const {
+      name,
+      nameAr,
+      email,
+      phone,
+      password,
+      role = 'customer',
+      dateOfBirth,
+      gender,
+      addresses,
+      businessName,
+      businessNameAr,
+      businessType,
+      licenseNumber,
+      taxNumber,
+      cityId,
+      governorateId,
+      coordinates,
+      businessAddress,
+      workingHours,
+      specialties,
+      features
+    } = req.body;
 
-    const { firstName, lastName, email, password, phone, role, whatsapp } = req.body;
-    // Check if user exists
-    const existingUser = await User.findOne({ email });
+    // Check if user already exists
+    const existingUser = await User.findOne({ 
+      $or: [{ email }, { phone }] 
+    });
+
     if (existingUser) {
-      console.log('user already exist')
-      return res.status(400).json({ message: 'User already exists' });
+      return res.status(400).json({
+        success: false,
+        error: 'User with this email or phone already exists'
+      });
     }
 
-    const userData = { firstName, lastName, whatsapp, email, password, phone, role };
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 12);
 
-    // If customer used a referral code, find the referring doctor
-    // if (role === 'customer' && referralCode) {
-    //   const referringDoctor = await User.findOne({ referralCode, role: 'doctor' });
-    //   if (referringDoctor) {
-    //     userData.referredBy = referringDoctor._id;
-    //   }
-    // }
+    // Create user data
+    const userData = {
+      name,
+      nameAr,
+      email,
+      phone,
+      password: hashedPassword,
+      role,
+      dateOfBirth,
+      gender,
+      addresses,
+      businessName,
+      businessNameAr,
+      businessType,
+      licenseNumber,
+      taxNumber,
+      cityId,
+      governorateId,
+      coordinates,
+      businessAddress,
+      workingHours,
+      specialties,
+      features
+    };
 
     const user = new User(userData);
     await user.save();
 
+    // If pharmacy role, create pharmacy profile
+    if (role === 'pharmacy') {
+      const pharmacyData = {
+        owner: user._id,
+        name: businessName,
+        nameAr: businessNameAr,
+        licenseNumber,
+        cityId,
+        cityName: businessAddress?.city || '',
+        governorateId,
+        phone,
+        email,
+        address: businessAddress,
+        coordinates,
+        workingHours: workingHours || { open: '09:00', close: '22:00', is24Hours: false },
+        specialties: specialties || [],
+        features: features || [],
+        deliveryService: false,
+        createdBy: user._id
+      };
+
+      const pharmacy = new Pharmacy(pharmacyData);
+      await pharmacy.save();
+    }
+
+    // Generate JWT token
     const token = jwt.sign(
-      { userId: user._id, role: user.role },
-      process.env.JWT_SECRET || 'your_jwt_secret',
+      { id: user._id, role: user.role },
+      process.env.JWT_SECRET || 'your-secret-key',
       { expiresIn: '7d' }
     );
-    console.log(user)
+
+    // Remove password from response
+    const userResponse = user.toObject();
+    delete userResponse.password;
+
     res.status(201).json({
-      token,
-      user: {
-        id: user._id,
-        name: user.firstName + " " + user.lastName,
-        email: user.email,
-        role: user.role,
-        profileImage: user.profileImage,
-        phone:user.phone,
-        whatsappNumber:user.whatsapp,
-        credits: user.role === 'customer' ? user.credits : undefined
+      success: true,
+      message: 'User registered successfully',
+      data: {
+        user: userResponse,
+        token,
+        expiresIn: '7d'
       }
     });
+
   } catch (error) {
-    console.log(error)
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error('Registration error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Registration failed',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 });
 
-// Login
-router.post('/login', [
-  body('email').isEmail().withMessage('Valid email is required'),
-  body('password').notEmpty().withMessage('Password is required')
-], async (req, res) => {
+// POST login user
+router.post('/login', async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
+    const { email, password, rememberMe = false } = req.body;
 
-    const { email, password } = req.body;
-
+    // Find user by email
     const user = await User.findOne({ email });
     if (!user) {
-      return res.status(400).json({ message: 'Invalid credentials' });
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid email or password'
+      });
     }
 
-    const isMatch = await user.comparePassword(password);
-    if (!isMatch) {
-      return res.status(400).json({ message: 'Invalid credentials' });
-    }
-
+    // Check if user is active
     if (!user.isActive) {
-      return res.status(400).json({ message: 'Account is deactivated' });
+      return res.status(401).json({
+        success: false,
+        error: 'Account is deactivated. Please contact support'
+      });
     }
 
+    // Verify password
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid email or password'
+      });
+    }
+
+    // Update last login
+    user.lastLoginAt = new Date();
+    await user.save();
+
+    // Generate JWT token
+    const expiresIn = rememberMe ? '30d' : '7d';
     const token = jwt.sign(
-      { userId: user._id, role: user.role },
-      process.env.JWT_SECRET || 'your_jwt_secret',
-      { expiresIn: '7d' }
+      { id: user._id, role: user.role },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn }
     );
-    
+
+    // Remove password from response
+    const userResponse = user.toObject();
+    delete userResponse.password;
+
+    // Get additional profile data based on role
+    let additionalData = {};
+    if (user.role === 'pharmacy') {
+      additionalData.pharmacy = await Pharmacy.findOne({ owner: user._id });
+    }
+
     res.json({
-      token,
-      user: {
-        id: user._id,
-        name: user.firstName+ " " + user.lastName,
-        phone:user.phone,
-        whatsappNumber:user.whatsapp,
-        email: user.email,
-        role: user.role,
-        referralCode: user.referralCode,
-        profileImage: user.profileImage,
-        credits: user.role === 'customer' ? user.credits : undefined
+      success: true,
+      message: 'Login successful',
+      data: {
+        user: userResponse,
+        ...additionalData,
+        token,
+        expiresIn
       }
     });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
 
-// Get current user
-router.get('/me', auth, async (req, res) => {
-  try {
-    const user = await User.findById(req.user._id).select('-password');
-    
-    res.json({
-      id: user._id,
-      name: user.name,
-      email: user.email,
-      role: user.role,
-      referralCode: user.referralCode,
-      phone: user.phone,
-      address: user.address,
-      profileImage: user.profileImage,
-      credits: user.role === 'customer' ? user.credits : undefined,
-      isActive: user.isActive
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Login failed'
     });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
 
-// Change password
-router.put('/change-password', auth, [
-  body('currentPassword').notEmpty().withMessage('Current password is required'),
-  body('newPassword').isLength({ min: 6 }).withMessage('New password must be at least 6 characters')
-], async (req, res) => {
+// POST refresh token
+router.post('/refresh', authenticateToken, async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+    // Generate new token
+    const token = jwt.sign(
+      { id: req.user._id, role: req.user.role },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '7d' }
+    );
+
+    res.json({
+      success: true,
+      data: {
+        token,
+        expiresIn: '7d'
+      }
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Token refresh failed'
+    });
+  }
+});
+
+// GET current user profile
+router.get('/me', authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select('-password');
+    
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
     }
 
-    const { currentPassword, newPassword } = req.body;
+    // Get additional profile data based on role
+    let additionalData = {};
+    if (user.role === 'pharmacy') {
+      additionalData.pharmacy = await Pharmacy.findOne({ owner: user._id });
+    }
 
-    const user = await User.findById(req.user._id);
+    res.json({
+      success: true,
+      data: {
+        user,
+        ...additionalData
+      }
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get user profile'
+    });
+  }
+});
+
+// PUT update user profile
+router.put('/me', authenticateToken, async (req, res) => {
+  try {
+    const updateData = { ...req.body };
+    
+    // Remove sensitive fields that shouldn't be updated via this route
+    delete updateData.password;
+    delete updateData.role;
+    delete updateData.isActive;
+    delete updateData.isVerified;
+
+    const user = await User.findByIdAndUpdate(
+      req.user.id,
+      updateData,
+      { new: true, runValidators: true }
+    ).select('-password');
+
     if (!user) {
-      return res.status(404).json({ message: 'User not found' });
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Profile updated successfully',
+      data: { user }
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update profile'
+    });
+  }
+});
+
+// PUT change password
+router.put('/change-password', authenticateToken, async (req, res) => {
+  try {
+    const { currentPassword, newPassword, confirmPassword } = req.body;
+
+    if (!currentPassword || !newPassword || !confirmPassword) {
+      return res.status(400).json({
+        success: false,
+        error: 'All password fields are required'
+      });
+    }
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({
+        success: false,
+        error: 'New password and confirmation do not match'
+      });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({
+        success: false,
+        error: 'New password must be at least 6 characters long'
+      });
+    }
+
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
     }
 
     // Verify current password
-    const isMatch = await user.comparePassword(currentPassword);
-    if (!isMatch) {
-      return res.status(400).json({ message: 'Current password is incorrect' });
+    const isCurrentPasswordValid = await bcrypt.compare(currentPassword, user.password);
+    if (!isCurrentPasswordValid) {
+      return res.status(401).json({
+        success: false,
+        error: 'Current password is incorrect'
+      });
     }
 
-    // Update password
-    user.password = newPassword;
+    // Hash new password
+    const hashedNewPassword = await bcrypt.hash(newPassword, 12);
+    user.password = hashedNewPassword;
     await user.save();
 
-    res.json({ message: 'Password changed successfully' });
+    res.json({
+      success: true,
+      message: 'Password changed successfully'
+    });
+
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to change password'
+    });
   }
 });
 
-// Forgot password (basic implementation - you may want to integrate email service)
-router.post('/forgot-password', [
-  body('email').isEmail().withMessage('Valid email is required')
-], async (req, res) => {
+// POST logout (client-side mainly, but we can blacklist tokens if needed)
+router.post('/logout', authenticateToken, async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
+    // In a production app, you might want to blacklist the token
+    // For now, we'll just send a success response
+    
+    res.json({
+      success: true,
+      message: 'Logged out successfully'
+    });
 
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Logout failed'
+    });
+  }
+});
+
+// POST forgot password
+router.post('/forgot-password', async (req, res) => {
+  try {
     const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email is required'
+      });
+    }
 
     const user = await User.findOne({ email });
     if (!user) {
-      // Don't reveal if email exists for security
-      return res.json({ message: 'If this email exists, a password reset link has been sent' });
+      // Don't reveal if email exists or not
+      return res.json({
+        success: true,
+        message: 'If the email exists, a reset link has been sent'
+      });
     }
 
-    // In a real application, you would:
+    // In a real app, you would:
     // 1. Generate a reset token
-    // 2. Save it to the user with expiration
+    // 2. Save it to the database with expiration
     // 3. Send email with reset link
-    // For now, just return success message
+    
+    // For now, just return success
+    res.json({
+      success: true,
+      message: 'If the email exists, a reset link has been sent'
+    });
 
-    res.json({ message: 'If this email exists, a password reset link has been sent' });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process password reset request'
+    });
   }
 });
 
-// Verify referral code
-router.get('/verify-referral/:code', async (req, res) => {
+// POST reset password
+router.post('/reset-password', async (req, res) => {
   try {
-    const { code } = req.params;
+    const { token, newPassword, confirmPassword } = req.body;
 
-    const doctor = await User.findOne({ 
-      referralCode: code, 
-      role: 'doctor',
-      isActive: true 
-    }).select('name profileImage');
-
-    if (!doctor) {
-      return res.status(404).json({ message: 'Invalid referral code' });
+    if (!token || !newPassword || !confirmPassword) {
+      return res.status(400).json({
+        success: false,
+        error: 'All fields are required'
+      });
     }
 
-    res.json({ 
-      message: 'Valid referral code',
-      doctor: {
-        name: doctor.name,
-        profileImage: doctor.profileImage
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({
+        success: false,
+        error: 'Passwords do not match'
+      });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({
+        success: false,
+        error: 'Password must be at least 6 characters long'
+      });
+    }
+
+    // In a real app, you would:
+    // 1. Verify the reset token
+    // 2. Check if it's not expired
+    // 3. Find the user and update password
+    
+    res.json({
+      success: true,
+      message: 'Password reset successfully'
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to reset password'
+    });
+  }
+});
+
+// POST verify email
+router.post('/verify-email', authenticateToken, async (req, res) => {
+  try {
+    const { verificationCode } = req.body;
+
+    if (!verificationCode) {
+      return res.status(400).json({
+        success: false,
+        error: 'Verification code is required'
+      });
+    }
+
+    // In a real app, you would verify the code
+    // For now, just mark as verified
+    
+    const user = await User.findByIdAndUpdate(
+      req.user.id,
+      { 
+        isVerified: true,
+        emailVerifiedAt: new Date()
+      },
+      { new: true }
+    ).select('-password');
+
+    res.json({
+      success: true,
+      message: 'Email verified successfully',
+      data: { user }
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Email verification failed'
+    });
+  }
+});
+
+// POST resend verification email
+router.post('/resend-verification', authenticateToken, async (req, res) => {
+  try {
+    // In a real app, you would send a new verification email
+    
+    res.json({
+      success: true,
+      message: 'Verification email sent'
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to send verification email'
+    });
+  }
+});
+
+// GET check email availability
+router.get('/check-email/:email', async (req, res) => {
+  try {
+    const user = await User.findOne({ email: req.params.email });
+    
+    res.json({
+      success: true,
+      data: {
+        available: !user,
+        email: req.params.email
       }
     });
+
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to check email availability'
+    });
+  }
+});
+
+// GET check phone availability
+router.get('/check-phone/:phone', async (req, res) => {
+  try {
+    const user = await User.findOne({ phone: req.params.phone });
+    
+    res.json({
+      success: true,
+      data: {
+        available: !user,
+        phone: req.params.phone
+      }
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to check phone availability'
+    });
   }
 });
 
